@@ -1376,8 +1376,14 @@ def render_risk_analysis_tab(result, selected_vendor, selected_product):
 
     past_dealings_count = vendor_history_data.get("transaction_count", 64)
     st.markdown(f"""
-    <p style="color:#8a9ab8; font-size:0.82rem; font-family:'Roboto Mono',monospace; letter-spacing:0.05em; margin-bottom:16px;">
+    <p style="color:#8a9ab8; font-size:0.82rem; font-family:'Roboto Mono',monospace; letter-spacing:0.05em; margin-bottom:6px;">
         Historical Risk Fluctuation (Past 12 Months) — Calculated from <span style="color:#c8d8f0;">{past_dealings_count}</span> past dealings
+    </p>
+    <p style="color:#6b7b98; font-size:0.62rem; font-family:'Roboto Mono',monospace; letter-spacing:0.04em;
+              margin-bottom:16px; padding:6px 10px; background:rgba(255,255,255,0.02); border-radius:4px;
+              border-left:2px solid rgba(240,184,64,0.3);">
+        ⚠ SIMULATED DATA — This timeline is synthetically generated around the vendor's real XGBoost risk score ({vendor_history_data.get('monthly_risk_history', [0])[0]:.2f} baseline).
+        It illustrates plausible risk fluctuation patterns but does not reflect actual month-by-month historical records.
     </p>
     """, unsafe_allow_html=True)
 
@@ -1450,8 +1456,15 @@ def render_risk_analysis_tab(result, selected_vendor, selected_product):
     st.markdown('<div class="section-header">Vendor Pattern Anomaly Detection</div>', unsafe_allow_html=True)
 
     st.markdown("""
-    <p style="color:#8a9ab8; font-size:0.82rem; font-family:'Roboto Mono',monospace; letter-spacing:0.05em; margin-bottom:16px;">
+    <p style="color:#8a9ab8; font-size:0.82rem; font-family:'Roboto Mono',monospace; letter-spacing:0.05em; margin-bottom:6px;">
         Order Volume Pattern Analysis — Detecting abnormal quotation quantities
+    </p>
+    <p style="color:#6b7b98; font-size:0.62rem; font-family:'Roboto Mono',monospace; letter-spacing:0.04em;
+              margin-bottom:16px; padding:6px 10px; background:rgba(255,255,255,0.02); border-radius:4px;
+              border-left:2px solid rgba(240,184,64,0.3);">
+        ⚠ SIMULATED DATA — Order volumes are synthetically generated based on the vendor's risk profile.
+        Higher-risk vendors produce more volume anomalies (spikes above threshold). This demonstrates the anomaly detection
+        concept but does not reflect actual purchase order history.
     </p>
     """, unsafe_allow_html=True)
 
