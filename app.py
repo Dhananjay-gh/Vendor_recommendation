@@ -1216,11 +1216,10 @@ def render_risk_analysis_tab(result, selected_vendor, selected_product):
 
     with col_iso2:
         fig_iso = go.Figure(go.Indicator(
-            mode="gauge+number",
+            mode="gauge",
             value=iso_score,
             domain={'x': [0, 1], 'y': [0, 1]},
             title={'text': "Population Outlier Score", 'font': {'color': '#94a3b8', 'family': 'Roboto Mono', 'size': 13}},
-            number={'font': {'color': '#f0f4ff', 'family': 'Inter', 'size': 40}},
             gauge={
                 'axis': {'range': [None, 1], 'tickwidth': 1, 'tickcolor': 'rgba(255,255,255,0.1)'},
                 'bar': {'color': iso_color, 'thickness': 0.35},
@@ -1239,6 +1238,16 @@ def render_risk_analysis_tab(result, selected_vendor, selected_product):
                 }
             }
         ))
+        
+        # Explicit annotation prevents text drift on zoom
+        fig_iso.add_annotation(
+            text=f"{iso_score:.3f}",
+            showarrow=False,
+            font=dict(color='#f0f4ff', family='Inter', size=40),
+            x=0.5, y=0.15,
+            xanchor='center', yanchor='bottom'
+        )
+
         fig_iso.update_layout(
             height=260,
             margin=dict(l=20, r=20, t=50, b=20),
