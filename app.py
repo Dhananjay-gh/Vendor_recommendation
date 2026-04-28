@@ -966,11 +966,10 @@ def render_risk_analysis_tab(result, selected_vendor, selected_product):
             gauge_color = '#f85149'  # red — high/critical risk
 
         fig_gauge = go.Figure(go.Indicator(
-            mode="gauge+number",
+            mode="gauge",
             value=fr,
             domain={'x': [0, 1], 'y': [0, 1]},
             title={'text': "Final Risk Score", 'font': {'color': '#94a3b8', 'family': 'Roboto Mono', 'size': 13}},
-            number={'font': {'color': '#f0f4ff', 'family': 'Inter', 'size': 40}},
             gauge={
                 'axis': {'range': [None, 1], 'tickwidth': 1, 'tickcolor': 'rgba(255,255,255,0.1)'},
                 'bar': {'color': gauge_color, 'thickness': 0.35},
@@ -989,6 +988,16 @@ def render_risk_analysis_tab(result, selected_vendor, selected_product):
                 }
             }
         ))
+        
+        # Explicit annotation prevents text drift on zoom
+        fig_gauge.add_annotation(
+            text=f"{fr:.2f}",
+            showarrow=False,
+            font=dict(color='#f0f4ff', family='Inter', size=40),
+            x=0.5, y=0.15,
+            xanchor='center', yanchor='bottom'
+        )
+
         fig_gauge.update_layout(
             height=300,
             margin=dict(l=20, r=20, t=50, b=20),
@@ -1028,7 +1037,9 @@ def render_risk_analysis_tab(result, selected_vendor, selected_product):
         fig_donut.add_annotation(
             text="Weights<br>60% / 40%",
             showarrow=False,
-            font=dict(size=13, color="#94a3b8", family="Roboto Mono")
+            font=dict(size=13, color="#94a3b8", family="Roboto Mono"),
+            x=0.5, y=0.5,
+            xanchor='center', yanchor='middle'
         )
 
         st.plotly_chart(fig_donut, use_container_width=True)
