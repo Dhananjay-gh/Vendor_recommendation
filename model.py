@@ -398,6 +398,54 @@ def procurement_risk_model(vendor_lifnr, product_name, current_price):
             f"(anomaly score: {iso_score:.2f}). No structural anomalies detected."
         )
 
+    # ── Isolation Forest Feature Deviation Analysis ──
+    # Compare this vendor's features against the entire population to
+    # identify which specific features make them stand out (or not).
+    feature_cols = {
+        "avg_days_overdue_hist": "Avg Days Overdue",
+        "late_ratio":           "Late Payment Ratio",
+        "total_spend_vol":      "Total Spend Volume",
+        "open_exposure":        "Open Exposure"
+    }
+    feature_deviations = []
+    for col, label in feature_cols.items():
+        vendor_val = float(row[col])
+        pop_mean   = float(df[col].mean())
+        pop_std    = float(df[col].std())
+        pop_median = float(df[col].median())
+        pop_p25    = float(df[col].quantile(0.25))
+        pop_p75    = float(df[col].quantile(0.75))
+        pop_p95    = float(df[col].quantile(0.95))
+
+        # Z-score: how many std deviations from mean
+        z_score = (vendor_val - pop_mean) / pop_std if pop_std > 0 else 0.0
+
+        # Determine deviation level
+        abs_z = abs(z_score)
+        if abs_z >= 3.0:
+            level = "EXTREME"
+        elif abs_z >= 2.0:
+            level = "HIGH"
+        elif abs_z >= 1.0:
+            level = "MODERATE"
+        else:
+            level = "NORMAL"
+
+        feature_deviations.append({
+            "feature":     label,
+            "vendor_val":  round(vendor_val, 2),
+            "pop_mean":    round(pop_mean, 2),
+            "pop_median":  round(pop_median, 2),
+            "pop_p25":     round(pop_p25, 2),
+            "pop_p75":     round(pop_p75, 2),
+            "pop_p95":     round(pop_p95, 2),
+            "z_score":     round(z_score, 2),
+            "level":       level,
+        })
+
+    # Sort so the most unusual features appear first
+    feature_deviations.sort(key=lambda x: abs(x["z_score"]), reverse=True)
+
     # ── Output ──
     return {
         "vendor_id": vendor_lifnr,
@@ -418,6 +466,7 @@ def procurement_risk_model(vendor_lifnr, product_name, current_price):
         "price_percentiles": price_percentiles,
         "isolation_score": vendor_pred["isolation_score"],
         "is_outlier": vendor_pred["is_outlier"],
+        "feature_deviations": feature_deviations,
     }
 
 

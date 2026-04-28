@@ -1246,20 +1246,116 @@ def render_risk_analysis_tab(result, selected_vendor, selected_product):
         )
         st.plotly_chart(fig_iso, use_container_width=True)
 
-    st.html(f"""
+    # ── Feature Deviation Breakdown ──
+    feature_deviations = result.get("feature_deviations", [])
+
+    if feature_deviations:
+        # Build the feature deviation cards
+        deviation_html = ""
+        for fd in feature_deviations:
+            level = fd["level"]
+            z = fd["z_score"]
+            # Color coding per level
+            if level == "EXTREME":
+                bar_color = "#f85149"
+                level_color = "#f85149"
+            elif level == "HIGH":
+                bar_color = "#f0b840"
+                level_color = "#f0b840"
+            elif level == "MODERATE":
+                bar_color = "#50a0ff"
+                level_color = "#50a0ff"
+            else:
+                bar_color = "#14f0a0"
+                level_color = "#14f0a0"
+
+            # Compute bar width (clamp z-score to 0-4 range, map to 0-100%)
+            bar_pct = min(abs(z) / 4.0, 1.0) * 100
+            direction = "above" if z > 0 else "below"
+
+            # Format vendor value nicely
+            v = fd["vendor_val"]
+            m = fd["pop_mean"]
+            if fd["feature"] == "Total Spend Volume" or fd["feature"] == "Open Exposure":
+                val_fmt = f"${v:,.0f}"
+                mean_fmt = f"${m:,.0f}"
+            elif fd["feature"] == "Late Payment Ratio":
+                val_fmt = f"{v:.1%}"
+                mean_fmt = f"{m:.1%}"
+            else:
+                val_fmt = f"{v:.1f} days"
+                mean_fmt = f"{m:.1f} days"
+
+            deviation_html += f"""
+            <div style="margin-bottom:14px;">
+                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px;">
+                    <span style="font-family:'Inter',sans-serif; font-size:0.8rem; color:#c8d8f0;">
+                        {fd['feature']}
+                    </span>
+                    <span style="font-family:'Roboto Mono',monospace; font-size:0.62rem;
+                                letter-spacing:0.08em; color:{level_color}; padding:2px 8px;
+                                background:rgba({','.join(str(int(level_color.lstrip('#')[i:i+2], 16)) for i in (0,2,4))},0.12);
+                                border-radius:4px;">
+                        {level}
+                    </span>
+                </div>
+                <div style="display:flex; align-items:center; gap:10px;">
+                    <div style="flex:1; height:6px; background:rgba(255,255,255,0.06); border-radius:3px; overflow:hidden;">
+                        <div style="width:{bar_pct}%; height:100%; background:{bar_color};
+                                    border-radius:3px; transition:width 1.2s cubic-bezier(0.4,0,0.2,1);"></div>
+                    </div>
+                    <span style="font-family:'Roboto Mono',monospace; font-size:0.68rem; color:#8a9ab8;
+                                min-width:60px; text-align:right;">
+                        z = {z:+.1f}
+                    </span>
+                </div>
+                <div style="display:flex; justify-content:space-between; margin-top:3px;">
+                    <span style="font-family:'Roboto Mono',monospace; font-size:0.62rem; color:#6b7b98;">
+                        Vendor: <span style="color:#c8d8f0;">{val_fmt}</span>
+                    </span>
+                    <span style="font-family:'Roboto Mono',monospace; font-size:0.62rem; color:#6b7b98;">
+                        Pop. Mean: {mean_fmt}
+                    </span>
+                </div>
+            </div>
+            """
+
+        # Generate natural language summary
+        unusual = [fd for fd in feature_deviations if fd["level"] in ("HIGH", "EXTREME")]
+        moderate = [fd for fd in feature_deviations if fd["level"] == "MODERATE"]
+        normal = [fd for fd in feature_deviations if fd["level"] == "NORMAL"]
+
+        if unusual:
+            standout_names = " and ".join([f'<span style="color:{("#f85149" if fd["level"]=="EXTREME" else "#f0b840")}">{fd["feature"]}</span>' for fd in unusual])
+            if normal:
+                normal_names = ", ".join([fd["feature"] for fd in normal])
+                nl_summary = f"Although {normal_names} {'are' if len(normal) > 1 else 'is'} within normal population bounds, {standout_names} {'are' if len(unusual) > 1 else 'is'} a statistically significant outlier — this specific combination is what makes this vendor stand out from the population."
+            else:
+                nl_summary = f"{standout_names} {'deviate' if len(unusual) > 1 else 'deviates'} significantly from population norms — this is the primary driver behind the anomaly detection flag."
+        elif moderate:
+            mod_names = " and ".join([fd["feature"] for fd in moderate])
+            nl_summary = f"No extreme deviations detected, but {mod_names} {'show' if len(moderate) > 1 else 'shows'} moderate variance from population averages. The vendor is not an outlier, but these features are worth monitoring over time."
+        else:
+            nl_summary = "All four features fall within normal population bounds. This vendor's behaviour is statistically typical — no single feature or combination of features deviates meaningfully from the norm."
+
+        st.html(f"""
 <div style="background:{'rgba(248,81,73,0.03)' if is_outlier else 'rgba(20,240,160,0.03)'};
             border-left:3px solid {iso_color}; padding:16px 20px; margin-top:16px;
             margin-bottom:16px; border-radius:0 8px 8px 0;">
     <div style="font-family:'Roboto Mono',monospace; font-size:0.65rem;
-                color:#8a9ab8; letter-spacing:0.1em; margin-bottom:8px;">
-        // CHART INTELLIGENCE SUMMARY
+                color:#8a9ab8; letter-spacing:0.1em; margin-bottom:12px;">
+        // FEATURE DEVIATION ANALYSIS — POPULATION COMPARISON
     </div>
-    <div style="font-family:'Inter',sans-serif; font-size:0.85rem;
-                color:#c8d8f0; line-height:1.5;">
-        {iso_desc} Isolation Forest evaluates vendors independently of their SAP risk class —
-        a vendor can be K-Means "Stable Mid-Tier" but still be a population outlier if their
-        specific combination of spend volume, overdue days, and late payment ratio is unusual.
-        This score complements, not replaces, the XGBoost classification.
+    {deviation_html}
+    <div style="margin-top:16px; padding-top:14px; border-top:1px solid rgba(255,255,255,0.06);">
+        <div style="font-family:'Roboto Mono',monospace; font-size:0.62rem;
+                    color:#6b7b98; letter-spacing:0.08em; margin-bottom:6px;">
+            // AI INTERPRETATION
+        </div>
+        <div style="font-family:'Inter',sans-serif; font-size:0.82rem;
+                    color:#c8d8f0; line-height:1.6;">
+            {nl_summary}
+        </div>
     </div>
 </div>
 """)
