@@ -356,8 +356,8 @@ def inject_landing_styles():
         margin: 18px auto 36px;
     }
 
-    /* ── Form card ── */
-    .form-card {
+    /* ── Form card (targets the Streamlit container by key) ── */
+    div[data-testid="stVerticalBlock"]:has(> div[data-testid="stForm"]) {
         background: rgba(12, 18, 36, 0.9);
         border: 1px solid rgba(255, 255, 255, 0.07);
         border-radius: 16px;
@@ -365,13 +365,6 @@ def inject_landing_styles():
         backdrop-filter: blur(12px);
         position: relative;
         overflow: hidden;
-    }
-    .form-card::before {
-        content: '';
-        position: absolute;
-        top: 0; left: 0; right: 0;
-        height: 1px;
-        background: linear-gradient(90deg, transparent, rgba(20, 240, 160, 0.4), transparent);
     }
     .form-card-title {
         font-family: 'Inter', sans-serif;
@@ -577,7 +570,6 @@ def render_landing_page():
         """, unsafe_allow_html=True)
 
         # Form card
-        st.markdown('<div class="form-card">', unsafe_allow_html=True)
         st.markdown('<p class="form-card-title">Target Transaction Configuration</p>', unsafe_allow_html=True)
 
         # sap_vendors already loaded above for metrics
