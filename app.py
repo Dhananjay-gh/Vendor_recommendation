@@ -1285,7 +1285,7 @@ def render_risk_analysis_tab(result, selected_vendor, selected_product):
     </p>
     """, unsafe_allow_html=True)
 
-    months = pd.date_range(end=pd.Timestamp.today(), periods=12, freq='M').strftime('%b %Y')
+    months = pd.date_range(end=pd.Timestamp.today(), periods=12, freq='ME').strftime('%b %Y')
     historical_risk = vendor_history_data["monthly_risk_history"]
 
     fig_history = go.Figure()
