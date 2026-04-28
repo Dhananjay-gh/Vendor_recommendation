@@ -450,7 +450,7 @@ def inject_landing_styles():
     /* ── Metric strip ── */
     .metrics-row {
         display: grid;
-        grid-template-columns: repeat(3, 1fr);
+        grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
         gap: 12px;
         margin-bottom: 32px;
     }
