@@ -3,6 +3,7 @@ import numpy as np
 import os
 import joblib
 import shap
+import hashlib
 
 # ──────────────────────────────────────────────────
 # PATHS
@@ -117,12 +118,12 @@ def get_sap_vendor_list():
             "lifnr": row["LIFNR"],
             "name": row["NAME1"],
             "risk_class": row["RISK_CLASS"],
-            "avg_days_overdue_hist": row.get("avg_days_overdue_hist", 0),
-            "late_ratio": row.get("late_ratio", 0),
-            "total_spend_vol": row.get("total_spend_vol", 0),
-            "open_exposure": row.get("open_exposure", 0),
-            "transaction_count": row.get("transaction_count", 0),
-            "kmeans_cluster": int(row.get("KMEANS_CLUSTER", 0)),
+            "avg_days_overdue_hist": float(row["avg_days_overdue_hist"]) if "avg_days_overdue_hist" in row.index else 0,
+            "late_ratio": float(row["late_ratio"]) if "late_ratio" in row.index else 0,
+            "total_spend_vol": float(row["total_spend_vol"]) if "total_spend_vol" in row.index else 0,
+            "open_exposure": float(row["open_exposure"]) if "open_exposure" in row.index else 0,
+            "transaction_count": int(row["transaction_count"]) if "transaction_count" in row.index else 0,
+            "kmeans_cluster": int(row["KMEANS_CLUSTER"]) if "KMEANS_CLUSTER" in row.index else 0,
         })
     return vendors
 
@@ -152,11 +153,11 @@ def predict_vendor_risk(lifnr):
     features_scaled = scaler.transform(features)
 
     # XGBoost prediction
-    predicted_class = int(xgb.predict(features_scaled)[0])         # 0, 1, 2, or 3
-    probabilities = xgb.predict_proba(features_scaled)[0]          # [p_A, p_B, p_C, p_D]
+    predicted_class = int(xgb.predict(features_scaled)[0])         # 0, 1, or 2
+    probabilities = xgb.predict_proba(features_scaled)[0]          # [p_A, p_B, p_HIGH]
 
     # Weighted risk score: sum(class_index * probability) / max_class
-    risk_score = sum(i * p for i, p in enumerate(probabilities)) / 3.0
+    risk_score = sum(i * p for i, p in enumerate(probabilities)) / 2.0
     risk_score = np.clip(risk_score, 0.0, 1.0)
 
     # K-Means cluster
@@ -168,8 +169,8 @@ def predict_vendor_risk(lifnr):
 
     # Normalize to 0-1 (higher = more anomalous) using the vendor's stored score
     # for consistency with population-level normalization done at training time
-    vendor_iso_score = float(row.get("ISOLATION_SCORE", 0.5))
-    vendor_is_outlier = bool(int(row.get("IS_OUTLIER", 0)))
+    vendor_iso_score = float(row["ISOLATION_SCORE"]) if "ISOLATION_SCORE" in row.index else 0.5
+    vendor_is_outlier = bool(int(row["IS_OUTLIER"])) if "IS_OUTLIER" in row.index else False
 
     # SHAP values for explainability
     shap_vals = _shap_explainer.shap_values(features_scaled)
@@ -232,13 +233,12 @@ def predict_vendor_risk(lifnr):
 
     return {
         "predicted_class": predicted_class,
-        "predicted_class_label": ["A", "B", "C", "D"][predicted_class],
+        "predicted_class_label": ["A", "B", "HIGH"][predicted_class],
         "risk_score": round(float(risk_score), 4),
         "probabilities": {
             "A": round(float(probabilities[0]), 4),
             "B": round(float(probabilities[1]), 4),
-            "C": round(float(probabilities[2]), 4),
-            "D": round(float(probabilities[3]), 4),
+            "HIGH": round(float(probabilities[2]), 4),
         },
         "kmeans_cluster": cluster,
         "isolation_score": round(vendor_iso_score, 4),
@@ -293,9 +293,17 @@ def forecast_product_price(product_name):
 # ──────────────────────────────────────────────────
 def compute_price_risk(product_name, current_price):
     df_p = pd.read_csv(PURCHASE_DATA_PATH)
-    prices = df_p[df_p["product_name"] == product_name]["price_per_unit"].values
+    df_p["date"] = pd.to_datetime(df_p["date"])
+    cutoff = pd.Timestamp.now() - pd.DateOffset(months=6)
+    df_recent = df_p[(df_p["product_name"] == product_name) & (df_p["date"] >= cutoff)]
+
+    # Fall back to full history if recent window has too few points
+    if len(df_recent) < 5:
+        df_recent = df_p[df_p["product_name"] == product_name]
+
+    prices = df_recent["price_per_unit"].values
     if len(prices) < 5:
-        return 0.5, {}   # fallback
+        return 0.5, {}
     p25 = float(np.percentile(prices, 25))
     p50 = float(np.percentile(prices, 50))
     p75 = float(np.percentile(prices, 75))
@@ -474,7 +482,7 @@ def get_vendor_history(vendor_lifnr):
 
     base_risk = vendor_pred["risk_score"]
     # Use vendor LIFNR hash for reproducible randomness
-    seed_val = hash(vendor_lifnr) % (2**31)
+    seed_val = int(hashlib.md5(vendor_lifnr.encode()).hexdigest()[:8], 16) % (2**31)
 
     # ── Monthly risk timeline (12 months) ──
     np.random.seed(seed_val)

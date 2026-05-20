@@ -8,6 +8,7 @@ from sklearn.cluster import KMeans
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import classification_report
 from sklearn.preprocessing import StandardScaler
+from sklearn.utils.class_weight import compute_sample_weight
 
 # Set directories
 DATA_DIR = os.path.join(os.path.dirname(__file__), 'files')
@@ -65,8 +66,8 @@ df_master['open_count'] = df_master['open_count'].fillna(0)
 df_master['avg_days_overdue_hist'] = df_master['avg_days_overdue_hist'].fillna(0)
 
 # Map target Risk Class
-# Assuming A is low risk, D is critical risk
-risk_map = {'A': 0, 'B': 1, 'C': 2, 'D': 3}
+# Merge C and D into a single class (2) for better model performance
+risk_map = {'A': 0, 'B': 1, 'C': 2, 'D': 2}
 df_master['RISK_CLASS_LABEL'] = df_master['RISK_CLASS'].map(risk_map)
 
 # Drop rows with missing TARGET risk class
@@ -91,6 +92,8 @@ X_test_scaled = scaler.transform(X_test)
 X_scaled = scaler.transform(X)   # full dataset for K-Means
 
 print("Training XGBoost Classifier...")
+sample_weights = compute_sample_weight(class_weight='balanced', y=y_train)
+
 xgb = XGBClassifier(
     n_estimators=100, 
     max_depth=4, 
@@ -98,13 +101,13 @@ xgb = XGBClassifier(
     eval_metric='mlogloss', 
     random_state=42
 )
-xgb.fit(X_train_scaled, y_train)
+xgb.fit(X_train_scaled, y_train, sample_weight=sample_weights)
 
 # Evaluate on held-out test set
 test_preds = xgb.predict(X_test_scaled)
 real_acc = np.mean(test_preds == y_test)
 print(f"XGBoost Real Test Accuracy: {real_acc:.2%}")
-print(classification_report(y_test, test_preds, target_names=['A','B','C','D']))
+print(classification_report(y_test, test_preds, target_names=['A','B','HIGH']))
 
 # Save real accuracy to model_metrics.json
 with open(os.path.join(SAVE_DIR, 'model_metrics.json'), 'w') as f:

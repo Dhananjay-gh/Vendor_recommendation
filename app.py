@@ -692,8 +692,6 @@ def render_landing_page():
                     st.session_state['page'] = 'analytics'
                     st.rerun()
 
-        st.markdown('</div>', unsafe_allow_html=True)
-
     # ── Footer ──
     st.markdown("""
     <div class="footer-note">
@@ -1560,8 +1558,13 @@ def render_vendor_comparison_tab(selected_vendor, selected_product):
     # Find selected vendor's rank and score
     selected_lifnr = st.session_state.get('selected_lifnr', '')
     selected_score = next((s for s in all_scores if s["vendor_id"] == selected_lifnr), None)
-    selected_rank = selected_score["rank"] if selected_score else 0
-    selected_final_risk = selected_score["final_risk"] if selected_score else 0
+
+    if not selected_score:
+        st.error("Selected vendor data not found in comparison results. Please re-run the analysis.")
+        return
+
+    selected_rank = selected_score["rank"]
+    selected_final_risk = selected_score["final_risk"]
 
     # ── Alert Banner ──
     if selected_final_risk >= 0.7:
