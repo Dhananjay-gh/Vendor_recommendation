@@ -21,3 +21,8 @@ Thumbs.db
 
 # ── Backup files ──
 *_backup.py
+
+# ── Secrets and Test scripts ──
+.streamlit/secrets.toml
+*.env
+test_api.py

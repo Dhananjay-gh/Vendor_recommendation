@@ -5,7 +5,240 @@ import requests
 import pandas as pd
 import numpy as np
 from streamlit_lottie import st_lottie
-from model import procurement_risk_model, get_sap_vendor_list, get_vendor_history
+from model import procurement_risk_model, get_sap_vendor_list, get_vendor_history, get_vendor_avg_price
+import requests as _requests
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# OPENROUTER API — AI CHATBOT (Task 1)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+import os
+try:
+    import streamlit as st
+    OPENROUTER_API_KEY = st.secrets.get("OPENROUTER_API_KEY", "") or os.environ.get("OPENROUTER_API_KEY", "")
+except Exception:
+    OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
+
+OPENROUTER_MODELS = [
+    "meta-llama/llama-3.3-70b-instruct:free",   # primary — very reliable
+    "nvidia/nemotron-3-super-120b-a12b:free",    # fallback — strong reasoning
+    "google/gemma-4-31b-it:free",                # fallback — Google latest
+]
+
+
+def call_openrouter(system_prompt, messages, max_tokens=1200, stream_placeholder=None):
+    """
+    Call OpenRouter with model fallback chain.
+    Returns (text, error) — one will always be None.
+    """
+    headers = {
+        "Content-Type":  "application/json",
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "HTTP-Referer":  "https://procurement-risk-analyzer.app",
+        "X-Title":       "Procurement Risk Analyzer",
+    }
+
+    full_messages = [{"role": "system", "content": system_prompt}] + messages
+
+    errors = []
+    for model in OPENROUTER_MODELS:
+        try:
+            resp = _requests.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers=headers,
+                json={
+                    "model":      model,
+                    "max_tokens": max_tokens,
+                    "messages":   full_messages,
+                    "stream":     True,
+                },
+                stream=True,
+                timeout=60,
+            )
+            if resp.status_code == 200:
+                full_text = ""
+                for chunk in resp.iter_lines():
+                    if chunk and chunk.startswith(b"data: "):
+                        data = chunk[6:]
+                        if data == b"[DONE]":
+                            break
+                        try:
+                            delta = json.loads(data)["choices"][0]["delta"].get("content", "")
+                            if delta:
+                                full_text += delta
+                                if stream_placeholder:
+                                    stream_text = full_text.replace('$', '\\$')
+                                    stream_placeholder.markdown(f'''<div class="analytic-card" style="padding: 16px 20px; margin-bottom: 16px;">
+<div style="color: #14f0a0; font-family: 'Roboto Mono', monospace; font-size: 0.7rem; margin-bottom: 12px; letter-spacing: 0.1em;">AI RISK ANALYST</div>
+
+{stream_text}▌
+
+</div>''', unsafe_allow_html=True)
+                        except Exception as json_e:
+                            continue
+                if stream_placeholder:
+                    stream_text = full_text.replace('$', '\\$')
+                    stream_placeholder.markdown(f'''<div class="analytic-card" style="padding: 16px 20px; margin-bottom: 16px;">
+<div style="color: #14f0a0; font-family: 'Roboto Mono', monospace; font-size: 0.7rem; margin-bottom: 12px; letter-spacing: 0.1em;">AI RISK ANALYST</div>
+
+{stream_text}
+
+</div>''', unsafe_allow_html=True)
+                return full_text.strip(), None
+            else:
+                errors.append(f"{model} ({resp.status_code})")
+        except Exception as e:
+            errors.append(f"{model} ({type(e).__name__})")
+            continue  # try next model
+
+    return None, f"All models failed. Debug info: {', '.join(errors)}"
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# BUILD CHATBOT CONTEXT — SYSTEM PROMPT (Task 2)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+def build_chatbot_context(result, selected_vendor, selected_product, all_vendor_scores):
+    """
+    Build the full system prompt for the AI Risk Analyst chatbot.
+    Uses all data from the analysis result, XGBoost prediction,
+    feature deviations, and all comparison vendor scores.
+    """
+    xgb = result.get("xgb_prediction", {})
+    deviations = result.get("feature_deviations", [])
+    pp = result.get("price_percentiles", {})
+
+    # K-Means cluster label mapping
+    cluster_labels = {
+        0: "Conservative Spenders",
+        1: "High-Volume Partners",
+        2: "At-Risk Outliers",
+        3: "Stable Mid-Tier",
+    }
+    cluster_id = xgb.get("kmeans_cluster", 0)
+    cluster_name = cluster_labels.get(cluster_id, f"Cluster {cluster_id}")
+
+    # Build deviation lines dynamically for ALL features
+    deviation_lines = []
+    for d in deviations:
+        feat_name = d["feature"]
+        vendor_val = d.get("vendor_val", 0)
+        pop_mean = d.get("pop_mean", 0)
+        z_score = d.get("z_score", 0)
+        level = d.get("level", "N/A")
+        deviation_lines.append(
+            f"{feat_name:<28}: vendor={vendor_val:.4f}  pop_mean={pop_mean:.4f}  "
+            f"z-score={z_score:+.2f}  level={level}"
+        )
+    deviation_block = "\n".join(deviation_lines) if deviation_lines else "No deviation data available."
+
+    # Build SHAP lines dynamically for ALL features
+    shap = xgb.get("shap_values", {})
+    def _shap_dir(val):
+        return "increases" if val > 0 else "decreases"
+
+    shap_lines = []
+    for feat_name, shap_val in shap.items():
+        shap_lines.append(
+            f"{feat_name:<28}: {shap_val:+.4f}  ← {_shap_dir(shap_val)} risk"
+        )
+    shap_block = "\n".join(shap_lines) if shap_lines else "No SHAP data available."
+
+    # Price percentile strings
+    p25_str = f"${pp.get('p25', 0):,.2f}" if pp else "N/A"
+    p50_str = f"${pp.get('p50', 0):,.2f}" if pp else "N/A"
+    p75_str = f"${pp.get('p75', 0):,.2f}" if pp else "N/A"
+    p90_str = f"${pp.get('p90', 0):,.2f}" if pp else "N/A"
+
+    # Build vendor comparison table
+    sap_vendors = get_sap_vendor_list()
+    vendor_name_map = {v['lifnr']: v['name'] for v in sap_vendors}
+
+    comparison_lines = []
+    for s in all_vendor_scores:
+        v_name = vendor_name_map.get(s["vendor_id"], s["vendor_id"])
+        comparison_lines.append(
+            f"  {s.get('rank', '-'):>4} | {v_name:<30} | {s['vendor_id']:<12} | "
+            f"{s['final_risk']:.2f}       | {s['vendor_risk']:.2f}        | "
+            f"{s['decision']:<10} | {s.get('isolation_score', 0.5):.2f}"
+        )
+    comparison_table = "\n".join(comparison_lines)
+
+    # Number of vendors in the population (for context)
+    pop_size = len(sap_vendors)
+
+    # Vendor health signals for chatbot context
+    years_active = xgb.get('years_active', 0)
+    dunning_level = xgb.get('dunning_level', 0)
+    is_blocked = xgb.get('is_payment_blocked', 0)
+    reversal_rate = xgb.get('reversal_rate', 0)
+    payment_consistency = xgb.get('payment_consistency', 0)
+    discount_capture = xgb.get('discount_capture_rate', 0)
+    voided_rate = xgb.get('voided_payment_rate', 0)
+    stale_rate = xgb.get('stale_payment_rate', 0)
+
+    system_prompt = f"""You are an AI Procurement Risk Analyst assistant. You have full access to the \
+dashboard data for the current analysis session. Answer all questions based \
+ONLY on this data. Be specific with numbers. Never make up values.
+
+=== SELECTED VENDOR ===
+Vendor: {selected_vendor} ({result.get('vendor_id', 'N/A')})
+Product Being Procured: {selected_product}
+Quoted Price: ${result.get('vendor_raw_price', 0):,.2f}
+
+=== RISK SCORES ===
+Final Risk Score    : {result.get('final_risk', 0):.2f} ({result.get('vendor_bucket', 'N/A')}) → {result.get('decision', 'N/A')}
+Vendor Risk         : {result.get('vendor_risk', 0):.2f}
+Price Risk          : {result.get('price_risk', 0):.2f}
+XGBoost Class       : {xgb.get('predicted_class_label', 'N/A')}
+SAP Class           : {xgb.get('sap_risk_label', 'N/A')} (Divergence: {'YES' if result.get('sap_divergence') else 'NO'})
+Isolation Forest    : {'OUTLIER' if result.get('is_outlier', False) else 'NORMAL'} (score: {result.get('isolation_score', 0.5):.4f})
+K-Means Cluster     : {cluster_name} (Cluster {cluster_id})
+
+=== VENDOR BEHAVIOUR — CORE METRICS (vs population of {pop_size} vendors) ===
+Avg Days Overdue    : {xgb.get('avg_days_overdue', 0):.1f} days
+Late Payment Ratio  : {xgb.get('late_ratio', 0):.4f}
+Total Spend Volume  : ${xgb.get('total_spend', 0):,.2f}
+Open Exposure       : ${xgb.get('open_exposure', 0):,.2f}
+Transaction Count   : {xgb.get('transaction_count', 0)}
+
+=== VENDOR HEALTH SIGNALS (from expanded SAP features) ===
+Years Active        : {years_active:.1f} years  ({'ESTABLISHED' if years_active >= 5 else 'GROWING' if years_active >= 2 else 'NEW VENDOR'})
+Payment Consistency : {payment_consistency:.2f} days std dev  (higher = more erratic payment behaviour)
+Payment Blocked     : {'YES — vendor has active payment/posting block in SAP' if is_blocked else 'NO — no blocks'}
+Dunning Level       : {dunning_level} / 4  ({'NO NOTICES' if dunning_level == 0 else 'ESCALATED — multiple dunning notices' if dunning_level >= 3 else 'WARNED — some dunning notices'})
+Reversal Rate       : {reversal_rate:.2%}  ({'HIGH — above 10% threshold' if reversal_rate > 0.1 else 'ACCEPTABLE' if reversal_rate > 0.05 else 'CLEAN'})
+Discount Capture    : {discount_capture:.2%}  (fraction of early payment discounts taken when offered)
+Voided Payment Rate : {voided_rate:.2%}  (fraction of payments voided)
+Stale Payment Rate  : {stale_rate:.2%}  (fraction of payments gone stale)
+
+=== FEATURE DEVIATION ANALYSIS (all {len(deviations)} features — z-scores vs population) ===
+{deviation_block}
+
+=== SHAP FEATURE IMPACT — ALL {len(shap)} FEATURES (XGBoost explanation) ===
+{shap_block}
+
+=== PRICE ANALYSIS ===
+AI Forecasted Price : ${result.get('forecasted_price', 0):,.2f}
+Market Hist. Average: ${result.get('avg_price', 0):,.2f}
+Vendor Hist. Average: ${result.get('vendor_historical_avg', 0):,.2f}
+Quoted Price        : ${result.get('vendor_raw_price', 0):,.2f}
+Price Variance      : {result.get('price_variance', 0):+.1%} vs forecast
+24-Month Trend      : {result.get('inflation_direction', 'stable')} ({result.get('inflation_percent', 0):+.1f}%)
+Price Percentiles   : P25={p25_str} | P50={p50_str} | P75={p75_str} | P90={p90_str}
+
+=== INVOICE CLEARANCE ===
+Avg Clearance Days  : {result.get('avg_clearance_days', 0)} days
+
+=== ALL VENDORS COMPARED (for {selected_product} at market price) ===
+  Rank | Vendor Name                    | Vendor ID    | Final Risk | Vendor Risk | Decision   | Outlier Score
+{comparison_table}
+
+Answer in clear, professional language. Use bullet points for lists.
+Always cite exact numbers from the data above in your answers.
+When explaining SHAP values, reference ALL {len(shap)} features listed above, not just the top 4.
+When comparing vendors, reference both vendors' actual values side by side."""
+
+    return system_prompt
+
 
 def load_lottieurl(url: str):
     r = requests.get(url)
@@ -17,6 +250,44 @@ def load_lottieurl(url: str):
 # ANALYTICS PAGE — PREMIUM STYLES
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 def setup_analytics_styles():
+    theme = st.session_state.get('theme', 'light')
+    
+    if theme == 'light':
+        css_vars = """
+        :root {
+            --bg-app: #f8fafc;
+            --bg-card: #ffffff;
+            --text-main: #334155;
+            --text-head: #0f172a;
+            --text-mute: #64748b;
+            --border-light: rgba(59, 130, 246, 0.2);
+            --border-med: rgba(59, 130, 246, 0.5);
+            --bg-hover: rgba(0,0,0,0.03);
+            --shadow-str: rgba(0,0,0,0.1);
+        }
+        """
+        st.session_state['plot_bg'] = '#ffffff'
+        st.session_state['paper_bg'] = '#f8fafc'
+        st.session_state['text_main'] = '#334155'
+    else:
+        css_vars = """
+        :root {
+            --bg-app: #050810;
+            --bg-card: #0a0e1a;
+            --text-main: #c8d8f0;
+            --text-head: #f0f4ff;
+            --text-mute: #94a3b8;
+            --border-light: rgba(255,255,255,0.06);
+            --border-med: rgba(255,255,255,0.15);
+            --bg-hover: rgba(255,255,255,0.03);
+            --shadow-str: rgba(0,0,0,0.5);
+        }
+        """
+        st.session_state['plot_bg'] = 'rgba(10,14,26,0.6)'
+        st.session_state['paper_bg'] = '#050810'
+        st.session_state['text_main'] = '#c8d8f0'
+        
+    st.markdown(f"<style>{css_vars}</style>", unsafe_allow_html=True)
     st.markdown("""
     <style>
     @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=Roboto+Mono:wght@400;500&display=swap');
@@ -38,19 +309,25 @@ def setup_analytics_styles():
 
     /* ── Full page background with grid texture ── */
     .stApp {
-        background: #050810;
+        background: var(--bg-app);
         background-image:
             linear-gradient(rgba(20, 240, 200, 0.025) 1px, transparent 1px),
             linear-gradient(90deg, rgba(20, 240, 200, 0.025) 1px, transparent 1px);
         background-size: 48px 48px;
         min-height: 100vh;
-        color: #c8d8f0;
+        color: var(--text-main);
+    }
+    
+    /* ── Fix Streamlit Widget Labels (e.g. toggle text) ── */
+    [data-testid="stWidgetLabel"] p, 
+    [data-testid="stToggle"] p {
+        color: var(--text-main) !important;
     }
 
     /* ── Typography ── */
     h1, h2, h3, h4 {
         font-family: 'Inter', sans-serif !important;
-        color: #f0f4ff !important;
+        color: var(--text-head) !important;
         font-weight: 700;
         letter-spacing: -0.02em;
     }
@@ -62,7 +339,7 @@ def setup_analytics_styles():
         font-weight: 500;
         letter-spacing: 0.18em;
         text-transform: uppercase;
-        color: #94a3b8;
+        color: var(--text-mute);
         border-left: 3px solid #14f0a0;
         padding-left: 14px;
         margin-bottom: 24px;
@@ -93,8 +370,8 @@ def setup_analytics_styles():
 
     /* ── Metric card (analytics) ── */
     .analytic-card {
-        background: rgba(10, 14, 26, 0.85);
-        border: 1px solid rgba(255,255,255,0.06);
+        background: var(--bg-card);
+        border: 1px solid var(--border-light);
         border-radius: 14px;
         padding: 28px 24px;
         position: relative;
@@ -116,7 +393,7 @@ def setup_analytics_styles():
     .analytic-card:hover {
         transform: translateY(-4px);
         border-color: rgba(20, 240, 160, 0.25);
-        box-shadow: 0 12px 32px rgba(0,0,0,0.5);
+        box-shadow: 0 12px 32px var(--shadow-str);
     }
     .analytic-card .card-label {
         font-family: 'Roboto Mono', monospace;
@@ -124,7 +401,7 @@ def setup_analytics_styles():
         font-weight: 500;
         letter-spacing: 0.12em;
         text-transform: uppercase;
-        color: #94a3b8;
+        color: var(--text-mute);
         margin-bottom: 16px;
         line-height: 1.5;
     }
@@ -155,11 +432,12 @@ def setup_analytics_styles():
     }
 
     /* ── Ghost back button ── */
-    .ghost-back .stButton > button {
-        background: #0a0e1a !important;
-        background-color: #0a0e1a !important;
-        border: 1px solid rgba(255,255,255,0.15) !important;
-        color: #ffffff !important;
+    div[data-testid="stButton"] > button,
+    .stButton > button {
+        background: transparent !important;
+        background-color: transparent !important;
+        border: 1px solid var(--border-med) !important;
+        color: var(--text-main) !important;
         box-shadow: none !important;
         font-family: 'Roboto Mono', monospace !important;
         font-size: 0.72rem !important;
@@ -167,19 +445,20 @@ def setup_analytics_styles():
         border-radius: 8px !important;
         transition: all 0.2s ease !important;
     }
-    .ghost-back .stButton > button:hover {
-        border-color: rgba(255, 255, 255, 0.5) !important;
-        color: #ffffff !important;
+    div[data-testid="stButton"] > button:hover,
+    .stButton > button:hover {
+        border-color: var(--text-main) !important;
+        color: var(--text-main) !important;
         transform: none !important;
-        background: #0a0e1a !important;
-        background-color: #0a0e1a !important;
-        box-shadow: inset 0 0 8px rgba(255,255,255,0.15), 0 0 8px rgba(255,255,255,0.15) !important;
+        background: var(--bg-hover) !important;
+        background-color: var(--bg-hover) !important;
+        box-shadow: none !important;
     }
 
     /* ── Invoice aging card ── */
     .aging-card {
-        background: rgba(10, 14, 26, 0.85);
-        border: 1px solid rgba(255,255,255,0.06);
+        background: var(--bg-card);
+        border: 1px solid var(--border-light);
         padding: 28px 32px;
         border-radius: 14px;
         position: relative;
@@ -195,9 +474,9 @@ def setup_analytics_styles():
 
     /* ── Insight alert overrides ── */
     .stAlert > div {
-        background: rgba(10, 14, 26, 0.85) !important;
-        color: #c8d8f0 !important;
-        border: 1px solid rgba(255,255,255,0.06) !important;
+        background: var(--bg-card) !important;
+        color: var(--text-main) !important;
+        border: 1px solid var(--border-light) !important;
         border-left: 3px solid #50a0ff !important;
         border-radius: 10px !important;
         font-family: 'Inter', sans-serif !important;
@@ -213,14 +492,14 @@ def setup_analytics_styles():
     .stTabs [data-baseweb="tab-list"] {
         gap: 0;
         background: transparent;
-        border-bottom: 1px solid rgba(255,255,255,0.06);
+        border-bottom: 1px solid var(--border-light);
     }
     .stTabs [data-baseweb="tab"] {
         font-family: 'Roboto Mono', monospace;
         font-size: 0.75rem;
         letter-spacing: 0.1em;
         text-transform: uppercase;
-        color: #94a3b8;
+        color: var(--text-mute);
         padding: 12px 24px;
         border-bottom: 2px solid transparent;
         background: transparent;
@@ -240,9 +519,39 @@ def setup_analytics_styles():
 # LANDING PAGE — PREMIUM STYLES
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 def inject_landing_styles():
+    theme = st.session_state.get('theme', 'light')
+    
+    if theme == 'light':
+        css_vars = """
+        :root {
+            --bg-app: #f8fafc;
+            --bg-card: #ffffff;
+            --text-main: #334155;
+            --text-head: #0f172a;
+            --text-mute: #64748b;
+        }
+        """
+    else:
+        css_vars = """
+        :root {
+            --bg-app: #050810;
+            --bg-card: #0a0e1a;
+            --text-main: #c8d8f0;
+            --text-head: #f0f4ff;
+            --text-mute: #94a3b8;
+        }
+        """
+
+    st.markdown(f"<style>{css_vars}</style>", unsafe_allow_html=True)
     st.markdown("""
     <style>
     @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=Roboto+Mono:wght@400;500&display=swap');
+
+    /* ── Fix Streamlit Widget Labels (e.g. toggle text) ── */
+    [data-testid="stWidgetLabel"] p, 
+    [data-testid="stToggle"] p {
+        color: var(--text-main) !important;
+    }
 
     /* ── Reset & base ── */
     html, body, [class*="css"] {
@@ -259,7 +568,7 @@ def inject_landing_styles():
 
     /* ── Full page background ── */
     .stApp {
-        background: #050810;
+        background: var(--bg-app);
         background-image:
             linear-gradient(rgba(20, 240, 200, 0.03) 1px, transparent 1px),
             linear-gradient(90deg, rgba(20, 240, 200, 0.03) 1px, transparent 1px);
@@ -327,7 +636,7 @@ def inject_landing_styles():
         font-family: 'Inter', sans-serif;
         font-size: clamp(2.4rem, 5vw, 4rem);
         font-weight: 800;
-        color: #f0f4ff;
+        color: var(--text-head);
         letter-spacing: -0.02em;
         line-height: 1.1;
         margin: 0 0 8px;
@@ -341,7 +650,7 @@ def inject_landing_styles():
     .hero-sub {
         font-family: 'Inter', sans-serif;
         font-size: 0.95rem;
-        color: #94a3b8;
+        color: var(--text-mute);
         font-weight: 300;
         letter-spacing: 0.01em;
         margin: 0;
@@ -358,8 +667,8 @@ def inject_landing_styles():
 
     /* ── Form card (targets the Streamlit container by key) ── */
     div[data-testid="stVerticalBlock"]:has(> div[data-testid="stForm"]) {
-        background: rgba(12, 18, 36, 0.9);
-        border: 1px solid rgba(255, 255, 255, 0.07);
+        background: var(--bg-card);
+        border: 1px solid var(--border-light);
         border-radius: 16px;
         padding: 36px 40px 40px;
         backdrop-filter: blur(12px);
@@ -372,7 +681,7 @@ def inject_landing_styles():
         font-weight: 600;
         letter-spacing: 0.18em;
         text-transform: uppercase;
-        color: #94a3b8;
+        color: var(--text-mute);
         margin-bottom: 28px;
         text-align: center;
     }
@@ -392,10 +701,10 @@ def inject_landing_styles():
     /* ── Override Streamlit selectbox & number_input ── */
     div[data-baseweb="select"] > div,
     div[data-baseweb="input"] > div {
-        background: rgba(6, 10, 24, 0.9) !important;
+        background: var(--bg-card) !important;
         border: 1px solid rgba(80, 160, 255, 0.18) !important;
         border-radius: 8px !important;
-        color: #c8d8f8 !important;
+        color: var(--text-main) !important;
         font-family: 'Inter', sans-serif !important;
         font-size: 0.9rem !important;
         transition: border-color 0.2s !important;
@@ -406,20 +715,20 @@ def inject_landing_styles():
     }
     div[data-baseweb="select"] svg { color: #50a0ff !important; }
     div[data-baseweb="popover"], ul[data-baseweb="menu"] {
-        background-color: #0a1020 !important;
+        background-color: var(--bg-card) !important;
         border: 1px solid rgba(80, 160, 255, 0.2) !important;
         border-radius: 8px !important;
     }
     li[role="option"] { 
-        color: #000000 !important; 
+        color: #0f172a !important; /* Force dark text since background is white */
         font-size: 0.88rem !important; 
         background-color: transparent !important;
     }
     li[role="option"]:hover, li[role="option"][aria-selected="true"] { 
         background-color: rgba(80, 160, 255, 0.2) !important; 
-        color: #000000 !important; 
+        color: #0f172a !important; 
     }
-    input[type="number"] { color: #c8d8f8 !important; }
+    input[type="number"] { color: var(--text-main) !important; }
 
     /* ── Primary submit button ── */
     div.stForm [data-testid="stFormSubmitButton"] > button {
@@ -455,8 +764,8 @@ def inject_landing_styles():
         margin-bottom: 32px;
     }
     .metric-cell {
-        background: rgba(10, 16, 32, 0.7);
-        border: 1px solid rgba(255, 255, 255, 0.05);
+        background: var(--bg-card);
+        border: 1px solid var(--border-light);
         border-radius: 10px;
         padding: 14px 16px;
         text-align: center;
@@ -465,7 +774,7 @@ def inject_landing_styles():
         font-family: 'Inter', sans-serif;
         font-size: 1.4rem;
         font-weight: 700;
-        color: #f0f4ff;
+        color: var(--text-head);
         line-height: 1;
         margin-bottom: 4px;
     }
@@ -475,7 +784,7 @@ def inject_landing_styles():
     .metric-label {
         font-family: 'Roboto Mono', monospace;
         font-size: 0.75rem;
-        color: #94a3b8;
+        color: var(--text-mute);
         letter-spacing: 0.08em;
         text-transform: uppercase;
     }
@@ -504,6 +813,19 @@ def inject_landing_styles():
 # LANDING PAGE
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 def render_landing_page():
+    # ── THEME TOGGLE ──
+    col_empty, col_toggle = st.columns([8, 1])
+    with col_toggle:
+        is_light = st.session_state.get('theme', 'light') == 'light'
+        if st.toggle("☀ Light Mode", value=is_light, key="landing_theme"):
+            if st.session_state.get('theme') != 'light':
+                st.session_state['theme'] = 'light'
+                st.rerun()
+        else:
+            if st.session_state.get('theme') != 'dark':
+                st.session_state['theme'] = 'dark'
+                st.rerun()
+
     inject_landing_styles()
 
     # Load real model accuracy from model_metrics.json
@@ -603,7 +925,7 @@ def render_landing_page():
             item_price = st.number_input(
                 label="price",
                 min_value=0.0,
-                value=1000.0,
+                value=0.0,
                 step=100.0,
                 label_visibility="collapsed",
                 format="%.2f",
@@ -689,6 +1011,8 @@ def render_landing_page():
                     st.session_state['selected_lifnr'] = selected_lifnr
                     st.session_state['selected_product'] = selected_product
                     st.session_state['all_vendor_scores'] = all_scores
+                    st.session_state.pop('chat_history', None)
+                    st.session_state.pop('chat_prefill', None)
                     st.session_state['page'] = 'analytics'
                     st.rerun()
 
@@ -704,6 +1028,19 @@ def render_landing_page():
 # ANALYTICS PAGE
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 def render_analytics_page():
+    # ── THEME TOGGLE ──
+    col_empty, col_toggle = st.columns([8, 1])
+    with col_toggle:
+        is_light = st.session_state.get('theme', 'light') == 'light'
+        if st.toggle("☀ Light Mode", value=is_light):
+            if st.session_state.get('theme') != 'light':
+                st.session_state['theme'] = 'light'
+                st.rerun()
+        else:
+            if st.session_state.get('theme') != 'dark':
+                st.session_state['theme'] = 'dark'
+                st.rerun()
+
     setup_analytics_styles()
     result = st.session_state.get('analysis_result', None)
     selected_vendor = st.session_state.get('selected_vendor', 'Vendor')
@@ -718,11 +1055,9 @@ def render_analytics_page():
     col_back, col_spacer_left, col_title, col_spacer_right, col_status = st.columns([1.5, 2.0, 5.0, 0.1, 3.4])
 
     with col_back:
-        st.markdown('<div class="ghost-back">', unsafe_allow_html=True)
         if st.button("← Back", use_container_width=True):
             st.session_state['page'] = 'input'
             st.rerun()
-        st.markdown('</div>', unsafe_allow_html=True)
 
     with col_title:
         st.markdown(f"""
@@ -752,14 +1087,17 @@ def render_analytics_page():
     # ── Section separator ──
     st.markdown('<div class="section-sep"></div>', unsafe_allow_html=True)
 
-    # ── TABS: Risk Analysis + Vendor Comparison ──
-    tab_analysis, tab_comparison = st.tabs(["Risk Analysis", "Vendor Comparison"])
+    # ── TABS: Risk Analysis + Vendor Comparison + AI Risk Analyst ──
+    tab_analysis, tab_comparison, tab_chatbot = st.tabs(["Risk Analysis", "Vendor Comparison", "AI Risk Analyst"])
 
     with tab_analysis:
         render_risk_analysis_tab(result, selected_vendor, selected_product)
 
     with tab_comparison:
         render_vendor_comparison_tab(selected_vendor, selected_product)
+
+    with tab_chatbot:
+        render_chatbot_tab(result, selected_vendor, selected_product)
 
 
 def render_risk_analysis_tab(result, selected_vendor, selected_product):
@@ -768,7 +1106,7 @@ def render_risk_analysis_tab(result, selected_vendor, selected_product):
     # ── SECTION: Core Metrics ──
     st.markdown('<div class="section-header">Core Risk Metrics</div>', unsafe_allow_html=True)
 
-    col1, col2, col3, col4 = st.columns(4, gap="medium")
+    col1, col2, col3, col4, col5 = st.columns(5, gap="small")
 
     with col1:
         vr = result['vendor_risk']
@@ -783,10 +1121,20 @@ def render_risk_analysis_tab(result, selected_vendor, selected_product):
     with col2:
         bucket = result['vendor_bucket']
         b_color = "#14f0a0" if bucket == "LOW" else "#f0b840" if bucket == "MEDIUM" else "#f85149"
+        
+        sap_label = result.get('sap_risk_label', result.get('xgb_prediction', {}).get('sap_risk_class', 'Unknown'))
+        divergence = result.get('sap_divergence', False)
+        
+        if divergence:
+            badge_html = f'<div style="margin-top: 8px; font-size: 0.7rem; color: #f0b840; border: 1px solid rgba(240, 184, 64, 0.4); background: rgba(240, 184, 64, 0.1); padding: 4px 6px; border-radius: 4px; display: inline-block;">⚠️ SAP: {sap_label} (Divergence)</div>'
+        else:
+            badge_html = f'<div style="margin-top: 8px; font-size: 0.7rem; color: var(--text-mute); border: 1px solid var(--border-med); background: transparent; padding: 4px 6px; border-radius: 4px; display: inline-block;">SAP: {sap_label}</div>'
+
         st.markdown(f"""
         <div class="analytic-card">
             <div class="card-label">Risk Classification<br>Tier</div>
             <div class="card-value" style="color:{b_color};">{bucket}</div>
+            {badge_html}
         </div>
         """, unsafe_allow_html=True)
 
@@ -808,10 +1156,10 @@ def render_risk_analysis_tab(result, selected_vendor, selected_product):
                 pos_color = "#14f0a0"
         else:
             pos_label = "N/A"
-            pos_color = "#94a3b8"
+            pos_color = "var(--text-mute)"
         pv = result['price_variance']
         pv_pct = f"{(pv * 100):+.1f}%"
-        pv_color = "#f85149" if pv > 0.15 else "#14f0a0" if pv < -0.05 else "#94a3b8"
+        pv_color = "#f85149" if pv > 0.15 else "#14f0a0" if pv < -0.05 else "var(--text-mute)"
         st.markdown(f"""
         <div class="analytic-card">
             <div class="card-label">Price Position<br>(Market Percentile)</div>
@@ -825,6 +1173,26 @@ def render_risk_analysis_tab(result, selected_vendor, selected_product):
         <div class="analytic-card">
             <div class="card-label">AI Forecasted Price<br>For {selected_product}</div>
             <div class="card-value" style="color:#50a0ff;">${result['forecasted_price']:,.2f}</div>
+            <div style="font-family:'Roboto Mono',monospace; font-size:0.65rem; color:var(--text-mute); margin-top:8px; letter-spacing:0.03em;">
+                HISTORICAL AVG (VENDOR): <span style="color:#14f0a0;">${result.get('vendor_historical_avg', 0):,.2f}</span>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    # ── 5th Card: Vendor Tenure (Years Active) ──
+    years_active = float(result.get('xgb_prediction', {}).get('years_active', 0))
+    years_color  = '#14f0a0' if years_active >= 5 else '#f0b840' if years_active >= 2 else '#f85149'
+    years_tag    = 'ESTABLISHED' if years_active >= 5 else 'GROWING' if years_active >= 2 else 'NEW VENDOR'
+
+    with col5:
+        st.markdown(f"""
+        <div class="analytic-card">
+            <div class="card-label">Vendor<br>Tenure</div>
+            <div class="card-value" style="color:{years_color};">{years_active:.1f}<span style="font-size:1rem;"> yrs</span></div>
+            <div style="margin-top:10px; font-family:'Roboto Mono',monospace;
+                        font-size:0.65rem; letter-spacing:0.1em; color:{years_color};">
+                {years_tag}
+            </div>
         </div>
         """, unsafe_allow_html=True)
 
@@ -846,11 +1214,11 @@ def render_risk_analysis_tab(result, selected_vendor, selected_product):
         trend_text = "This product's price has remained <b>stable</b> over the last 24 months with no significant inflationary or deflationary trends."
 
     st.markdown(f"""
-    <div style="background: rgba(10, 14, 26, 0.85); border: 1px solid rgba(255,255,255,0.06); border-left: 3px solid {trend_color}; border-radius: 10px; padding: 20px 24px; margin-top: 32px; animation: fadeSlideUp 0.6s ease-out both;">
+    <div style="background: var(--bg-card); border: 1px solid var(--border-light); border-left: 3px solid {trend_color}; border-radius: 10px; padding: 20px 24px; margin-top: 32px; animation: fadeSlideUp 0.6s ease-out both;">
         <div style="font-family:'Roboto Mono',monospace; font-size:0.75rem; font-weight:600; color:{trend_color}; letter-spacing:0.1em; text-transform:uppercase; margin-bottom:8px;">
             <span style="font-size:1.1rem; margin-right:6px;">{trend_icon}</span> 24-Month Market Trend Analysis
         </div>
-        <div style="font-family:'Inter',sans-serif; font-size:0.95rem; color:#c8d8f0; line-height:1.5;">
+        <div style="font-family:'Inter',sans-serif; font-size:0.95rem; color:var(--text-main); line-height:1.5;">
             {trend_text}
         </div>
     </div>
@@ -888,30 +1256,30 @@ def render_risk_analysis_tab(result, selected_vendor, selected_product):
                     <div style="width:0; height:0; border-left:6px solid transparent; border-right:6px solid transparent; border-top:8px solid #14f0a0; margin:0 auto;"></div>
                 </div>
                 <!-- Bar track -->
-                <div style="position:absolute; bottom:0; left:0; right:0; height:6px; background:rgba(255,255,255,0.05); border-radius:3px;"></div>
+                <div style="position:absolute; bottom:0; left:0; right:0; height:6px; background:var(--border-light); border-radius:3px;"></div>
                 <!-- Percentile markers -->
-                <div style="position:absolute; bottom:-2px; left:{pos_p25}%; width:2px; height:10px; background:#94a3b8; transform:translateX(-50%);"></div>
-                <div style="position:absolute; bottom:-2px; left:{pos_p50}%; width:2px; height:10px; background:#94a3b8; transform:translateX(-50%);"></div>
-                <div style="position:absolute; bottom:-2px; left:{pos_p75}%; width:2px; height:10px; background:#94a3b8; transform:translateX(-50%);"></div>
-                <div style="position:absolute; bottom:-2px; left:{pos_p90}%; width:2px; height:10px; background:#94a3b8; transform:translateX(-50%);"></div>
+                <div style="position:absolute; bottom:-2px; left:{pos_p25}%; width:2px; height:10px; background:var(--text-mute); transform:translateX(-50%);"></div>
+                <div style="position:absolute; bottom:-2px; left:{pos_p50}%; width:2px; height:10px; background:var(--text-mute); transform:translateX(-50%);"></div>
+                <div style="position:absolute; bottom:-2px; left:{pos_p75}%; width:2px; height:10px; background:var(--text-mute); transform:translateX(-50%);"></div>
+                <div style="position:absolute; bottom:-2px; left:{pos_p90}%; width:2px; height:10px; background:var(--text-mute); transform:translateX(-50%);"></div>
             </div>
             <!-- Labels row -->
-            <div style="position:relative; height:28px; font-family:'Roboto Mono',monospace; font-size:0.65rem; color:#94a3b8;">
+            <div style="position:relative; height:28px; font-family:'Roboto Mono',monospace; font-size:0.65rem; color:var(--text-mute);">
                 <div style="position:absolute; left:{pos_p25}%; transform:translateX(-50%); text-align:center;">
                     <div>P25</div>
-                    <div style="color:#c8d8f0;">${p25:,.0f}</div>
+                    <div style="color:var(--text-main);">${p25:,.0f}</div>
                 </div>
                 <div style="position:absolute; left:{pos_p50}%; transform:translateX(-50%); text-align:center;">
                     <div>P50</div>
-                    <div style="color:#c8d8f0;">${p50:,.0f}</div>
+                    <div style="color:var(--text-main);">${p50:,.0f}</div>
                 </div>
                 <div style="position:absolute; left:{pos_p75}%; transform:translateX(-50%); text-align:center;">
                     <div>P75</div>
-                    <div style="color:#c8d8f0;">${p75:,.0f}</div>
+                    <div style="color:var(--text-main);">${p75:,.0f}</div>
                 </div>
                 <div style="position:absolute; left:{pos_p90}%; transform:translateX(-50%); text-align:center;">
                     <div>P90</div>
-                    <div style="color:#c8d8f0;">${p90:,.0f}</div>
+                    <div style="color:var(--text-main);">${p90:,.0f}</div>
                 </div>
             </div>
         </div>
@@ -929,21 +1297,68 @@ def render_risk_analysis_tab(result, selected_vendor, selected_product):
     <div class="aging-card" style="border-left: 3px solid {aging_color};">
         <div style="display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:16px;">
             <div style="flex:1; min-width:300px;">
-                <p style="margin:0 0 6px 0; color:#94a3b8; font-family:'Roboto Mono',monospace; font-size:0.75rem; font-weight:600; letter-spacing:0.1em; text-transform:uppercase;">Clearance Timeline</p>
-                <p style="margin:0; color:#c8d8f0; font-size:0.95rem; font-family:'Inter',sans-serif;">
-                    Supplier profiling indicates that <span style="color:#f0f4ff; font-weight:600;">{selected_product}</span> orders from
-                    <span style="color:#f0f4ff; font-weight:600;">{selected_vendor}</span> usually take
+                <p style="margin:0 0 6px 0; color:var(--text-mute); font-family:'Roboto Mono',monospace; font-size:0.75rem; font-weight:600; letter-spacing:0.1em; text-transform:uppercase;">Clearance Timeline</p>
+                <p style="margin:0; color:var(--text-main); font-size:0.95rem; font-family:'Inter',sans-serif;">
+                    Supplier profiling indicates that <span style="color:var(--text-head); font-weight:600;">{selected_product}</span> orders from
+                    <span style="color:var(--text-head); font-weight:600;">{selected_vendor}</span> usually take
                     <span style="color:{aging_color}; font-weight:700;">{result['avg_clearance_days']} days</span> to clear.
                 </p>
             </div>
             <div style="text-align:right;">
                 <span style="font-family:'Inter',sans-serif; font-size:2.8rem; font-weight:800; color:{aging_color}; line-height:1;">{result['avg_clearance_days']}</span>
                 <span style="font-family:'Roboto Mono',monospace; font-size:0.9rem; color:{aging_color}; margin-left:4px;">d</span>
-                <div style="color:#94a3b8; font-family:'Roboto Mono',monospace; font-size:0.75rem; letter-spacing:0.1em; text-transform:uppercase; margin-top:4px;">Avg Clearance</div>
+                <div style="color:var(--text-mute); font-family:'Roboto Mono',monospace; font-size:0.75rem; letter-spacing:0.1em; text-transform:uppercase; margin-top:4px;">Avg Clearance</div>
             </div>
         </div>
     </div>
     """, unsafe_allow_html=True)
+
+    # ── Section separator ──
+    st.markdown('<div class="section-sep"></div>', unsafe_allow_html=True)
+
+    # ── SECTION: Vendor Health Scorecard ──
+    st.markdown('<div class="section-header">Vendor Health Signals</div>',
+                unsafe_allow_html=True)
+
+    xgb_pred = result.get('xgb_prediction', {})
+
+    years_active_h  = float(xgb_pred.get('years_active', 0))
+    dunning_level   = int(xgb_pred.get('dunning_level', 0))
+    is_blocked      = int(xgb_pred.get('is_payment_blocked', 0))
+    reversal_rate_h = float(xgb_pred.get('reversal_rate', 0))
+
+    # Color logic
+    years_color_h   = '#14f0a0' if years_active_h >= 5 else '#f0b840' if years_active_h >= 2 else '#f85149'
+    dunning_color   = '#14f0a0' if dunning_level == 0 else '#f0b840' if dunning_level <= 2 else '#f85149'
+    block_color     = '#f85149' if is_blocked else '#14f0a0'
+    reversal_color  = '#14f0a0' if reversal_rate_h < 0.05 else '#f0b840' if reversal_rate_h < 0.15 else '#f85149'
+
+    block_label     = 'BLOCKED' if is_blocked else 'CLEAR'
+    dunning_label   = f'{dunning_level} / 4'
+
+    col_h1, col_h2, col_h3, col_h4 = st.columns(4, gap="small")
+
+    for col, label, value, color, sublabel in [
+        (col_h1, 'Years Active',    f'{years_active_h:.1f} yrs', years_color_h,
+         'NEW VENDOR' if years_active_h < 2 else 'ESTABLISHED' if years_active_h >= 5 else 'GROWING'),
+        (col_h2, 'Dunning Level',   dunning_label,              dunning_color,
+         'NO NOTICES' if dunning_level == 0 else 'ESCALATED' if dunning_level >= 3 else 'WARNED'),
+        (col_h3, 'SAP Block Status',block_label,                block_color,
+         'PAYMENT BLOCKED' if is_blocked else 'NO BLOCKS'),
+        (col_h4, 'Reversal Rate',   f'{reversal_rate_h:.1%}',   reversal_color,
+         'HIGH REVERSALS' if reversal_rate_h > 0.15 else 'ACCEPTABLE' if reversal_rate_h > 0.05 else 'CLEAN'),
+    ]:
+        with col:
+            st.markdown(f"""
+            <div class="analytic-card">
+                <div class="card-label">{label}</div>
+                <div class="card-value" style="color:{color};">{value}</div>
+                <div style="margin-top:10px; font-family:'Roboto Mono',monospace;
+                            font-size:0.65rem; letter-spacing:0.1em; color:{color};">
+                    {sublabel}
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
 
     # ── Section separator ──
     st.markdown('<div class="section-sep"></div>', unsafe_allow_html=True)
@@ -953,94 +1368,206 @@ def render_risk_analysis_tab(result, selected_vendor, selected_product):
 
     viz_col1, viz_col2 = st.columns(2, gap="medium")
 
+    is_light = st.session_state.get('theme', 'light') == 'light'
+    if is_light:
+        radar_grid_color = 'rgba(0,0,0,0.1)'
+        radar_line_color = 'rgba(0,0,0,0.1)'
+        radar_tick_color = '#334155'
+        radar_text_color = '#334155'
+        radar_bg_color = 'rgba(0,0,0,0.03)'
+    else:
+        radar_grid_color = 'rgba(255,255,255,0.25)'  # brighter
+        radar_line_color = 'rgba(255,255,255,0.30)'  # brighter
+        radar_tick_color = '#c8d8f0'
+        radar_text_color = '#c8d8f0'
+        radar_bg_color = 'rgba(255,255,255,0.02)'
+
     with viz_col1:
         # Determine gauge bar color based on risk level
         fr = result['final_risk']
         if fr < 0.3:
             gauge_color = '#14f0a0'  # green — low risk
+            gauge_label = "LOW RISK"
         elif fr < 0.7:
             gauge_color = '#f0b840'  # amber — medium risk
+            gauge_label = "MEDIUM RISK"
         else:
             gauge_color = '#f85149'  # red — high/critical risk
+            gauge_label = "HIGH RISK"
+
+        if is_light:
+            bar_color_rgba = 'rgba(0,0,0,0)'
+            step1_color = 'rgba(20, 240, 160, 0.85)' if fr < 0.3 else 'rgba(20, 240, 160, 0.12)'
+            step2_color = 'rgba(240, 184, 64, 0.85)' if 0.3 <= fr < 0.7 else 'rgba(240, 184, 64, 0.12)'
+            step3_color = 'rgba(248, 81, 73, 0.85)' if fr >= 0.7 else 'rgba(248, 81, 73, 0.12)'
+            threshold_dict = {}
+        else:
+            bar_color_rgba = gauge_color
+            step1_color = 'rgba(20, 240, 160, 0.25)'
+            step2_color = 'rgba(240, 184, 64, 0.25)'
+            step3_color = 'rgba(248, 81, 73, 0.25)'
+            threshold_dict = {
+                'line': {'color': gauge_color, 'width': 4},
+                'thickness': 0.85,
+                'value': fr
+            }
+
+        gauge_config = {
+            'axis': {'range': [None, 1], 'tickwidth': 1, 'tickcolor': 'var(--border-med)'},
+            'bar': {'color': bar_color_rgba, 'thickness': 0.35},
+            'bgcolor': 'rgba(0,0,0,0)',
+            'borderwidth': 1,
+            'bordercolor': 'var(--border-light)',
+            'steps': [
+                {'range': [0, 0.3], 'color': step1_color},
+                {'range': [0.3, 0.7], 'color': step2_color},
+                {'range': [0.7, 1.0], 'color': step3_color}
+            ]
+        }
+        if threshold_dict:
+            gauge_config['threshold'] = threshold_dict
 
         fig_gauge = go.Figure(go.Indicator(
             mode="gauge",
             value=fr,
             domain={'x': [0, 1], 'y': [0, 1]},
-            title={'text': "Final Risk Score", 'font': {'color': '#94a3b8', 'family': 'Roboto Mono', 'size': 13}},
-            gauge={
-                'axis': {'range': [None, 1], 'tickwidth': 1, 'tickcolor': 'rgba(255,255,255,0.1)'},
-                'bar': {'color': gauge_color, 'thickness': 0.35},
-                'bgcolor': 'rgba(0,0,0,0)',
-                'borderwidth': 1,
-                'bordercolor': 'rgba(255,255,255,0.08)',
-                'steps': [
-                    {'range': [0, 0.3], 'color': 'rgba(20, 240, 160, 0.25)'},
-                    {'range': [0.3, 0.7], 'color': 'rgba(240, 184, 64, 0.25)'},
-                    {'range': [0.7, 1.0], 'color': 'rgba(248, 81, 73, 0.25)'}
-                ],
-                'threshold': {
-                    'line': {'color': gauge_color, 'width': 4},
-                    'thickness': 0.85,
-                    'value': fr
-                }
-            }
+            title={'text': "Final Risk Score", 'font': {'color': 'var(--text-mute)', 'family': 'Roboto Mono', 'size': 13}},
+            gauge=gauge_config
         ))
         
         # Explicit annotation prevents text drift on zoom
         fig_gauge.add_annotation(
             text=f"{fr:.2f}",
             showarrow=False,
-            font=dict(color='#f0f4ff', family='Inter', size=40),
+            font=dict(color='var(--text-head)', family='Inter', size=40),
             x=0.5, y=0.15,
             xanchor='center', yanchor='bottom'
         )
+        # Add risk level label
+        fig_gauge.add_annotation(
+            text=gauge_label,
+            showarrow=False,
+            font=dict(color=gauge_color, family='Roboto Mono', size=13),
+            x=0.5, y=0.10,
+            xanchor='center', yanchor='top'
+        )
 
         fig_gauge.update_layout(
-            height=300,
-            margin=dict(l=20, r=20, t=50, b=20),
-            paper_bgcolor='rgba(0,0,0,0)',
-            plot_bgcolor='rgba(10,14,26,0.6)',
-            font={'family': "Inter, sans-serif", 'color': '#c8d8f0'},
+            height=320,
+            margin=dict(l=40, r=40, t=40, b=40),
+            paper_bgcolor=st.session_state.get('paper_bg', 'rgba(0,0,0,0)'),
+            plot_bgcolor=st.session_state.get('plot_bg', 'rgba(10,14,26,0.6)'),
+            font={'family': "Inter, sans-serif", 'color': st.session_state.get('text_main', 'var(--text-main)')},
             transition={'duration': 1200, 'easing': 'cubic-in-out'}
         )
         st.plotly_chart(fig_gauge, use_container_width=True)
 
+        # ── Gauge Intelligence Summary ──
+        st.html(f"""
+<div style="border-left:3px solid {gauge_color}; padding:14px 18px;
+            margin-top:12px; border-radius:0 8px 8px 0;
+            background:{radar_bg_color};">
+    <div style="font-family:'Roboto Mono',monospace; font-size:0.65rem;
+                color:#8a9ab8; letter-spacing:0.1em; margin-bottom:6px;">
+        // RISK SCORE SUMMARY
+    </div>
+    <div style="font-family:'Inter',sans-serif; font-size:0.82rem;
+                color:{radar_text_color}; line-height:1.5;">
+        This combined risk score reflects overall vendor unreliability, aggregating late payments,
+        historical defaults, and SAP flags. A high score suggests immediate mitigation is required before further procurement.
+    </div>
+</div>
+""")
+
     with viz_col2:
-        labels = ['Vendor Reliability Risk', 'Market Price Risk']
-        values = [result['vendor_risk'] * 0.6, result['price_risk'] * 0.4]
-        colors_donut = ['#50a0ff', '#14f0a0']
+        # ── Payment Discipline Radar Chart ──
+        xgb_radar = result['xgb_prediction']
 
-        fig_donut = go.Figure(data=[go.Pie(
-            labels=labels,
-            values=values,
-            hole=.65,
-            marker=dict(colors=colors_donut, line=dict(color='#050810', width=3)),
-            textinfo='label+percent',
-            textposition='outside',
-            hoverinfo='label+percent+value',
-            textfont=dict(color='#c8d8f0', family='Inter', size=11)
-        )])
+        axes = ['Late Payment\nRatio', 'Payment\nConsistency', 'Discount\nCapture Risk',
+                'Voided\nPayments', 'Reversal\nRate']
 
-        fig_donut.update_layout(
-            title={'text': "Risk Contribution Breakdown", 'font': {'color': '#94a3b8', 'family': 'Roboto Mono', 'size': 13}},
-            height=300,
-            margin=dict(l=20, r=20, t=50, b=20),
-            paper_bgcolor='rgba(0,0,0,0)',
-            plot_bgcolor='rgba(10,14,26,0.6)',
+        values_radar = [
+            float(xgb_radar.get('late_ratio', 0)),
+            min(float(xgb_radar.get('payment_consistency', 0)) / 30.0, 1.0),
+            1.0 - float(xgb_radar.get('discount_capture_rate', 0.5)),
+            float(xgb_radar.get('voided_payment_rate', 0)),
+            float(xgb_radar.get('reversal_rate', 0)),
+        ]
+        values_closed = values_radar + [values_radar[0]]
+        axes_closed   = axes  + [axes[0]]
+
+        # Color based on vendor_bucket
+        bucket_radar = result.get('vendor_bucket', 'MEDIUM')
+        radar_color = {
+            'LOW':      '#14f0a0',
+            'MEDIUM':   '#f0b840',
+            'HIGH':     '#f85149',
+            'CRITICAL': '#ff0000',
+        }.get(bucket_radar, '#f0b840')
+
+        # Build rgba fill color from hex
+        r_hex = int(radar_color[1:3], 16)
+        g_hex = int(radar_color[3:5], 16)
+        b_hex = int(radar_color[5:7], 16)
+        fill_rgba = f'rgba({r_hex},{g_hex},{b_hex},0.15)'
+
+        fig_radar = go.Figure()
+        fig_radar.add_trace(go.Scatterpolar(
+            r=values_closed,
+            theta=axes_closed,
+            fill='toself',
+            fillcolor=fill_rgba,
+            line=dict(color=radar_color, width=2),
+            name='Payment Discipline',
+        ))
+        fig_radar.update_layout(
+            polar=dict(
+                bgcolor='rgba(10,14,26,0.0)',
+                radialaxis=dict(
+                    visible=True,
+                    range=[0, 1],
+                    tickfont=dict(size=9, color=radar_tick_color),
+                    gridcolor=radar_grid_color,
+                    linecolor=radar_line_color,
+                ),
+                angularaxis=dict(
+                    tickfont=dict(size=10, color=radar_tick_color),
+                    gridcolor=radar_grid_color,
+                    linecolor=radar_line_color,
+                ),
+            ),
+            paper_bgcolor=st.session_state.get('paper_bg', 'rgba(0,0,0,0)'),
+            plot_bgcolor='rgba(0,0,0,0)',
+            margin=dict(l=40, r=40, t=40, b=40),
+            height=320,
             showlegend=False,
-            font={'family': "Inter, sans-serif", 'color': '#c8d8f0'}
+            title=dict(
+                text='Payment Discipline Profile',
+                font=dict(size=12, color='#94a3b8',
+                          family="'Roboto Mono', monospace"),
+                x=0.5,
+            ),
         )
+        st.plotly_chart(fig_radar, use_container_width=True)
 
-        fig_donut.add_annotation(
-            text="Weights<br>60% / 40%",
-            showarrow=False,
-            font=dict(size=13, color="#94a3b8", family="Roboto Mono"),
-            x=0.5, y=0.5,
-            xanchor='center', yanchor='middle'
-        )
-
-        st.plotly_chart(fig_donut, use_container_width=True)
+        # ── Radar Intelligence Summary ──
+        st.html(f"""
+<div style="border-left:3px solid {radar_color}; padding:14px 18px;
+            margin-top:12px; border-radius:0 8px 8px 0;
+            background:{radar_bg_color};">
+    <div style="font-family:'Roboto Mono',monospace; font-size:0.65rem;
+                color:#8a9ab8; letter-spacing:0.1em; margin-bottom:6px;">
+        // CHART INTELLIGENCE SUMMARY
+    </div>
+    <div style="font-family:'Inter',sans-serif; font-size:0.82rem;
+                color:{radar_text_color}; line-height:1.5;">
+        Each axis shows a distinct dimension of payment behaviour (0 = best,
+        1 = worst). A wide polygon indicates systemic payment problems across
+        multiple dimensions. A narrow polygon concentrated on one axis suggests
+        a single specific issue rather than general unreliability.
+    </div>
+</div>
+""")
 
     # ── Section separator ──
     st.markdown('<div class="section-sep"></div>', unsafe_allow_html=True)
@@ -1056,17 +1583,17 @@ def render_risk_analysis_tab(result, selected_vendor, selected_product):
             mode="number+gauge",
             value=result['vendor_risk'],
             domain={'x': [0.1, 1], 'y': [0, 1]},
-            number={'font': {'color': '#f0f4ff', 'family': 'Inter'}},
-            title={'text': "<b>Vendor Reliability Risk</b><br><span style='font-size:0.8em;color:#94a3b8'>Based on internal transaction history</span>"},
+            number={'font': {'color': 'var(--text-head)', 'family': 'Inter'}},
+            title={'text': "<b>Vendor Reliability Risk</b><br><span style='font-size:0.8em;color:var(--text-mute)'>Based on internal transaction history</span>"},
             gauge={
                 'shape': "bullet",
                 'axis': {'range': [min(0.0, result['vendor_risk'] - 0.1), 1]},
                 'threshold': {'line': {'color': v_color, 'width': 4}, 'thickness': 0.75, 'value': result['vendor_risk']},
                 'bar': {'color': v_color},
-                'bgcolor': 'rgba(255,255,255,0.03)',
+                'bgcolor': 'var(--bg-hover)',
             }
         ))
-        fig_v.update_layout(height=150, margin=dict(t=30, b=20, l=200, r=20), paper_bgcolor='rgba(0,0,0,0)', font={'color': "#c8d8f0", 'family': 'Inter'})
+        fig_v.update_layout(height=150, margin=dict(t=30, b=20, l=200, r=20), paper_bgcolor=st.session_state.get('paper_bg', 'rgba(0,0,0,0)'), font={'color': "var(--text-main)", 'family': 'Inter'})
         st.plotly_chart(fig_v, use_container_width=True)
 
     with insight_col2:
@@ -1076,17 +1603,17 @@ def render_risk_analysis_tab(result, selected_vendor, selected_product):
             mode="number+gauge",
             value=variance,
             domain={'x': [0.1, 1], 'y': [0, 1]},
-            number={'font': {'color': '#f0f4ff', 'family': 'Inter'}},
-            title={'text': "<b>Market Price Variance</b><br><span style='font-size:0.8em;color:#94a3b8'>Deviation from average</span>"},
+            number={'font': {'color': 'var(--text-head)', 'family': 'Inter'}},
+            title={'text': "<b>Market Price Variance</b><br><span style='font-size:0.8em;color:var(--text-mute)'>Deviation from average</span>"},
             gauge={
                 'shape': "bullet",
                 'axis': {'range': [min(0.0, variance - 0.1), max(1.0, variance + 0.2)]},
                 'threshold': {'line': {'color': p_color, 'width': 4}, 'thickness': 0.75, 'value': variance},
                 'bar': {'color': p_color},
-                'bgcolor': 'rgba(255,255,255,0.03)',
+                'bgcolor': 'var(--bg-hover)',
             }
         ))
-        fig_p.update_layout(height=150, margin=dict(t=30, b=20, l=200, r=20), paper_bgcolor='rgba(0,0,0,0)', font={'color': "#c8d8f0", 'family': 'Inter'})
+        fig_p.update_layout(height=150, margin=dict(t=30, b=20, l=200, r=20), paper_bgcolor=st.session_state.get('paper_bg', 'rgba(0,0,0,0)'), font={'color': "var(--text-main)", 'family': 'Inter'})
         st.plotly_chart(fig_p, use_container_width=True)
 
     # ── Executive Summary ──
@@ -1105,15 +1632,39 @@ def render_risk_analysis_tab(result, selected_vendor, selected_product):
     st.markdown('<div class="section-header">XGBoost Feature Impact</div>', unsafe_allow_html=True)
 
     shap_vals = result["xgb_prediction"]["shap_values"]
-    feature_label_map = {
-        "avg_days_overdue": "Avg Days Overdue",
-        "late_ratio": "Late Payment Ratio",
-        "total_spend": "Total Spend Volume",
-        "open_exposure": "Open Exposure",
-    }
-    shap_labels = [feature_label_map[k] for k in shap_vals.keys()]
-    shap_values_list = list(shap_vals.values())
+    
+    # Split into positive (risk drivers) and negative (risk mitigators)
+    positive_shap = {k: v for k, v in shap_vals.items() if v > 0}
+    negative_shap = {k: v for k, v in shap_vals.items() if v < 0}
+
+    # Sort each separately
+    pos_sorted = sorted(positive_shap.items(), key=lambda x: x[1], reverse=True)
+    neg_sorted = sorted(negative_shap.items(), key=lambda x: x[1])
+
+    # Take top 3 positive and top 2 negative
+    top_pos = dict(pos_sorted[:3])
+    top_neg = dict(neg_sorted[:2])
+    
+    # Sum the remaining into "Other Factors"
+    other_pos = sum(v for k, v in pos_sorted[3:])
+    other_neg = sum(v for k, v in neg_sorted[2:])
+
+    top_shap = {**top_pos, **top_neg}
+    if other_pos > 0.0001:
+        top_shap["Other Risk Drivers"] = other_pos
+    if other_neg < -0.0001:
+        top_shap["Other Risk Mitigators"] = other_neg
+    
+    # Sort final for visual descending order
+    top_shap = dict(sorted(top_shap.items(), key=lambda x: x[1], reverse=True))
+
+    # Reverse for plotting (Plotly horizontal bar charts draw from bottom up)
+    shap_labels = list(reversed(list(top_shap.keys())))
+    shap_values_list = list(reversed(list(top_shap.values())))
     shap_colors = ['#f85149' if v > 0 else '#14f0a0' for v in shap_values_list]
+
+    # Compact chart height since we limit to max 6 bars
+    shap_chart_height = 240
 
     fig_shap = go.Figure(go.Bar(
         x=shap_values_list,
@@ -1122,23 +1673,56 @@ def render_risk_analysis_tab(result, selected_vendor, selected_product):
         marker_color=shap_colors,
         text=[f"{v:+.4f}" for v in shap_values_list],
         textposition='outside',
-        textfont=dict(color='#94a3b8', family='Roboto Mono', size=11),
+        textfont=dict(color='var(--text-mute)', family='Roboto Mono', size=11),
     ))
     fig_shap.update_layout(
-        height=220,
+        height=shap_chart_height,
         margin=dict(l=20, r=60, t=10, b=10),
-        paper_bgcolor='rgba(0,0,0,0)',
-        plot_bgcolor='rgba(10,14,26,0.6)',
-        font=dict(color='#94a3b8', family='Inter'),
+        paper_bgcolor=st.session_state.get('paper_bg', 'rgba(0,0,0,0)'),
+        plot_bgcolor=st.session_state.get('plot_bg', 'rgba(10,14,26,0.6)'),
+        font=dict(color='var(--text-mute)', family='Inter'),
         xaxis=dict(
             title="SHAP Value (impact on prediction)",
-            gridcolor='rgba(255,255,255,0.03)',
-            zerolinecolor='rgba(255,255,255,0.1)',
-            title_font=dict(size=11, color='#94a3b8', family='Roboto Mono'),
+            gridcolor='var(--bg-hover)',
+            zerolinecolor='var(--border-med)',
+            title_font=dict(size=11, color='var(--text-mute)', family='Roboto Mono'),
         ),
-        yaxis=dict(gridcolor='rgba(255,255,255,0.03)'),
+        yaxis=dict(gridcolor='var(--bg-hover)'),
     )
     st.plotly_chart(fig_shap, use_container_width=True)
+
+    with st.expander("View All Feature Impacts"):
+        sorted_all = sorted(shap_vals.items(), key=lambda x: abs(x[1]), reverse=True)
+        all_shap_labels = list(reversed(list(dict(sorted_all).keys())))
+        all_shap_values = list(reversed(list(dict(sorted_all).values())))
+        all_shap_colors = ['#f85149' if v > 0 else '#14f0a0' for v in all_shap_values]
+        
+        all_chart_height = max(220, len(all_shap_labels) * 30 + 40)
+        
+        fig_shap_all = go.Figure(go.Bar(
+            x=all_shap_values,
+            y=all_shap_labels,
+            orientation='h',
+            marker_color=all_shap_colors,
+            text=[f"{v:+.4f}" for v in all_shap_values],
+            textposition='outside',
+            textfont=dict(color='var(--text-mute)', family='Roboto Mono', size=11),
+        ))
+        fig_shap_all.update_layout(
+            height=all_chart_height,
+            margin=dict(l=20, r=60, t=10, b=10),
+            paper_bgcolor=st.session_state.get('paper_bg', 'rgba(0,0,0,0)'),
+            plot_bgcolor=st.session_state.get('plot_bg', 'rgba(10,14,26,0.6)'),
+            font=dict(color='var(--text-mute)', family='Inter'),
+            xaxis=dict(
+                title="SHAP Value (impact on prediction)",
+                gridcolor='var(--bg-hover)',
+                zerolinecolor='var(--border-med)',
+                title_font=dict(size=11, color='var(--text-mute)', family='Roboto Mono'),
+            ),
+            yaxis=dict(gridcolor='var(--bg-hover)'),
+        )
+        st.plotly_chart(fig_shap_all, use_container_width=True)
 
     # ── SHAP Intelligence Summary ──
     positive_shap = {k: v for k, v in shap_vals.items() if v > 0}
@@ -1147,13 +1731,13 @@ def render_risk_analysis_tab(result, selected_vendor, selected_product):
     primary_driver = max(shap_vals, key=lambda k: shap_vals[k]) if positive_shap else None
     risk_mitigator = min(shap_vals, key=lambda k: shap_vals[k]) if negative_shap else None
 
-    driver_text = f"Primary risk driver: <strong style='color:#f0f4ff;'>{feature_label_map.get(primary_driver, primary_driver)}</strong> (SHAP: <span style='color:#f85149; font-weight:700;'>+{shap_vals[primary_driver]:.4f}</span>)." if primary_driver else "No features are actively increasing risk for this vendor."
-    mitigator_text = f" Risk mitigator: <strong style='color:#f0f4ff;'>{feature_label_map.get(risk_mitigator, risk_mitigator)}</strong> (SHAP: <span style='color:#14f0a0; font-weight:700;'>{shap_vals[risk_mitigator]:.4f}</span>)." if risk_mitigator else ""
+    driver_text = f"Primary risk driver: <strong style='color:var(--text-head);'>{primary_driver}</strong> (SHAP: <span style='color:#f85149; font-weight:700;'>+{shap_vals[primary_driver]:.4f}</span>)." if primary_driver else "No features are actively increasing risk for this vendor."
+    mitigator_text = f" Risk mitigator: <strong style='color:var(--text-head);'>{risk_mitigator}</strong> (SHAP: <span style='color:#14f0a0; font-weight:700;'>{shap_vals[risk_mitigator]:.4f}</span>)." if risk_mitigator else ""
 
     if primary_driver and abs(shap_vals.get(primary_driver, 0)) > abs(shap_vals.get(risk_mitigator, 0) if risk_mitigator else 0):
-        verdict = f"The model's classification is primarily driven by <strong style='color:#f0f4ff;'>{feature_label_map.get(primary_driver, primary_driver)}</strong>."
+        verdict = f"The model's classification is primarily driven by <strong style='color:var(--text-head);'>{primary_driver}</strong>."
     elif risk_mitigator:
-        verdict = f"<strong style='color:#f0f4ff;'>{feature_label_map.get(risk_mitigator, risk_mitigator)}</strong> is the strongest factor pulling risk down for this vendor."
+        verdict = f"<strong style='color:var(--text-head);'>{risk_mitigator}</strong> is the strongest factor pulling risk down for this vendor."
     else:
         verdict = "Feature contributions are balanced with no single dominant factor."
 
@@ -1169,7 +1753,7 @@ def render_risk_analysis_tab(result, selected_vendor, selected_product):
     <div style="font-family:'Roboto Mono',monospace; font-size:0.65rem; color:#8a9ab8; letter-spacing:0.1em; margin-bottom:8px;">
         // CHART INTELLIGENCE SUMMARY
     </div>
-    <div style="font-family:'Inter',sans-serif; font-size:0.85rem; color:#c8d8f0; line-height:1.5;">
+    <div style="font-family:'Inter',sans-serif; font-size:0.85rem; color:var(--text-main); line-height:1.5;">
         {driver_text}{mitigator_text} {verdict}
     </div>
 </div>
@@ -1213,45 +1797,70 @@ def render_risk_analysis_tab(result, selected_vendor, selected_product):
         """, unsafe_allow_html=True)
 
     with col_iso2:
+        is_light = st.session_state.get('theme', 'light') == 'light'
+        if is_light:
+            iso_bar_color_rgba = 'rgba(0,0,0,0)'
+            iso_step1_color = 'rgba(20, 240, 160, 0.85)' if iso_score <= 0.5 else 'rgba(20, 240, 160, 0.12)'
+            iso_step2_color = 'rgba(240, 184, 64, 0.85)' if 0.5 < iso_score <= 0.75 else 'rgba(240, 184, 64, 0.12)'
+            iso_step3_color = 'rgba(248, 81, 73, 0.85)' if iso_score > 0.75 else 'rgba(248, 81, 73, 0.12)'
+            iso_threshold_dict = {}
+        else:
+            iso_bar_color_rgba = iso_color
+            iso_step1_color = 'rgba(20, 240, 160, 0.25)'
+            iso_step2_color = 'rgba(240, 184, 64, 0.25)'
+            iso_step3_color = 'rgba(248, 81, 73, 0.25)'
+            iso_threshold_dict = {
+                'line': {'color': iso_color, 'width': 4},
+                'thickness': 0.85,
+                'value': iso_score
+            }
+
+        iso_gauge_config = {
+            'axis': {'range': [None, 1], 'tickwidth': 1, 'tickcolor': 'var(--border-med)'},
+            'bar': {'color': iso_bar_color_rgba, 'thickness': 0.35},
+            'bgcolor': 'rgba(0,0,0,0)',
+            'borderwidth': 1,
+            'bordercolor': 'var(--border-light)',
+            'steps': [
+                {'range': [0, 0.5], 'color': iso_step1_color},
+                {'range': [0.5, 0.75], 'color': iso_step2_color},
+                {'range': [0.75, 1.0], 'color': iso_step3_color}
+            ]
+        }
+        if iso_threshold_dict:
+            iso_gauge_config['threshold'] = iso_threshold_dict
+
         fig_iso = go.Figure(go.Indicator(
             mode="gauge",
             value=iso_score,
             domain={'x': [0, 1], 'y': [0, 1]},
-            title={'text': "Population Outlier Score", 'font': {'color': '#94a3b8', 'family': 'Roboto Mono', 'size': 13}},
-            gauge={
-                'axis': {'range': [None, 1], 'tickwidth': 1, 'tickcolor': 'rgba(255,255,255,0.1)'},
-                'bar': {'color': iso_color, 'thickness': 0.35},
-                'bgcolor': 'rgba(0,0,0,0)',
-                'borderwidth': 1,
-                'bordercolor': 'rgba(255,255,255,0.08)',
-                'steps': [
-                    {'range': [0, 0.5], 'color': 'rgba(20, 240, 160, 0.25)'},
-                    {'range': [0.5, 0.75], 'color': 'rgba(240, 184, 64, 0.25)'},
-                    {'range': [0.75, 1.0], 'color': 'rgba(248, 81, 73, 0.25)'}
-                ],
-                'threshold': {
-                    'line': {'color': iso_color, 'width': 4},
-                    'thickness': 0.85,
-                    'value': iso_score
-                }
-            }
+            title={'text': "Population Outlier Score", 'font': {'color': 'var(--text-mute)', 'family': 'Roboto Mono', 'size': 13}},
+            gauge=iso_gauge_config
         ))
         
         # Explicit annotation prevents text drift on zoom
         fig_iso.add_annotation(
             text=f"{iso_score:.3f}",
             showarrow=False,
-            font=dict(color='#f0f4ff', family='Inter', size=40),
+            font=dict(color='var(--text-head)', family='Inter', size=40),
             x=0.5, y=0.15,
             xanchor='center', yanchor='bottom'
+        )
+        # Add isolation level label
+        fig_iso.add_annotation(
+            text=iso_label,
+            showarrow=False,
+            font=dict(color=iso_color, family='Roboto Mono', size=13),
+            x=0.5, y=0.10,
+            xanchor='center', yanchor='top'
         )
 
         fig_iso.update_layout(
             height=260,
             margin=dict(l=20, r=20, t=50, b=20),
-            paper_bgcolor='rgba(0,0,0,0)',
-            plot_bgcolor='rgba(10,14,26,0.6)',
-            font={'family': "Inter, sans-serif", 'color': '#c8d8f0'},
+            paper_bgcolor=st.session_state.get('paper_bg', 'rgba(0,0,0,0)'),
+            plot_bgcolor=st.session_state.get('plot_bg', 'rgba(10,14,26,0.6)'),
+            font={'family': "Inter, sans-serif", 'color': st.session_state.get('text_main', 'var(--text-main)')},
             transition={'duration': 1200, 'easing': 'cubic-in-out'}
         )
         st.plotly_chart(fig_iso, use_container_width=True)
@@ -1260,75 +1869,89 @@ def render_risk_analysis_tab(result, selected_vendor, selected_product):
     feature_deviations = result.get("feature_deviations", [])
 
     if feature_deviations:
-        # Build the feature deviation cards
-        deviation_html = ""
-        for fd in feature_deviations:
-            level = fd["level"]
-            z = fd["z_score"]
-            # Color coding per level
-            if level == "EXTREME":
-                bar_color = "#f85149"
-                level_color = "#f85149"
-            elif level == "HIGH":
-                bar_color = "#f0b840"
-                level_color = "#f0b840"
-            elif level == "MODERATE":
-                bar_color = "#50a0ff"
-                level_color = "#50a0ff"
-            else:
-                bar_color = "#14f0a0"
-                level_color = "#14f0a0"
+        # Sort feature deviations by absolute z-score descending
+        feature_deviations = sorted(feature_deviations, key=lambda x: abs(x["z_score"]), reverse=True)
+        
+        top_n = 3
+        top_deviations = feature_deviations[:top_n]
+        other_deviations = feature_deviations[top_n:]
 
-            # Compute bar width (clamp z-score to 0-4 range, map to 0-100%)
-            bar_pct = min(abs(z) / 4.0, 1.0) * 100
-            direction = "above" if z > 0 else "below"
+        def build_deviation_html(deviations_list):
+            html = ""
+            for fd in deviations_list:
+                level = fd["level"]
+                z = fd["z_score"]
+                # Color coding per level
+                if level == "EXTREME":
+                    bar_color = "#f85149"
+                    level_color = "#f85149"
+                elif level == "HIGH":
+                    bar_color = "#f0b840"
+                    level_color = "#f0b840"
+                elif level == "MODERATE":
+                    bar_color = "#50a0ff"
+                    level_color = "#50a0ff"
+                else:
+                    bar_color = "#14f0a0"
+                    level_color = "#14f0a0"
 
-            # Format vendor value nicely
-            v = fd["vendor_val"]
-            m = fd["pop_mean"]
-            if fd["feature"] == "Total Spend Volume" or fd["feature"] == "Open Exposure":
-                val_fmt = f"${v:,.0f}"
-                mean_fmt = f"${m:,.0f}"
-            elif fd["feature"] == "Late Payment Ratio":
-                val_fmt = f"{v:.1%}"
-                mean_fmt = f"{m:.1%}"
-            else:
-                val_fmt = f"{v:.1f} days"
-                mean_fmt = f"{m:.1f} days"
+                # Compute bar width (clamp z-score to 0-4 range, map to 0-100%)
+                bar_pct = min(abs(z) / 4.0, 1.0) * 100
+                direction = "above" if z > 0 else "below"
 
-            deviation_html += f"""
-            <div style="margin-bottom:14px;">
-                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px;">
-                    <span style="font-family:'Inter',sans-serif; font-size:0.8rem; color:#c8d8f0;">
-                        {fd['feature']}
-                    </span>
-                    <span style="font-family:'Roboto Mono',monospace; font-size:0.62rem;
-                                letter-spacing:0.08em; color:{level_color}; padding:2px 8px;
-                                background:rgba({','.join(str(int(level_color.lstrip('#')[i:i+2], 16)) for i in (0,2,4))},0.12);
-                                border-radius:4px;">
-                        {level}
-                    </span>
-                </div>
-                <div style="display:flex; align-items:center; gap:10px;">
-                    <div style="flex:1; height:6px; background:rgba(255,255,255,0.06); border-radius:3px; overflow:hidden;">
-                        <div style="width:{bar_pct}%; height:100%; background:{bar_color};
-                                    border-radius:3px; transition:width 1.2s cubic-bezier(0.4,0,0.2,1);"></div>
+                # Format vendor value nicely
+                v = fd["vendor_val"]
+                m = fd["pop_mean"]
+                if fd["feature"] == "Total Spend Volume" or fd["feature"] == "Open Exposure":
+                    val_fmt = f"${v:,.0f}"
+                    mean_fmt = f"${m:,.0f}"
+                elif fd["feature"] in ("Late Payment Ratio", "Reversal Rate", "Discount Capture Rate", "Voided Payment Rate", "Stale Payment Rate"):
+                    val_fmt = f"{v:.1%}"
+                    mean_fmt = f"{m:.1%}"
+                elif fd["feature"] in ("Payment Consistency Score", "Years Active", "Dunning Level", "Payment Terms Risk", "Is Payment Blocked"):
+                    val_fmt = f"{v:.1f}"
+                    mean_fmt = f"{m:.1f}"
+                else:
+                    val_fmt = f"{v:.1f} days"
+                    mean_fmt = f"{m:.1f} days"
+
+                html += f"""
+                <div style="margin-bottom:14px;">
+                    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px;">
+                        <span style="font-family:'Inter',sans-serif; font-size:0.8rem; color:var(--text-main);">
+                            {fd['feature']}
+                        </span>
+                        <span style="font-family:'Roboto Mono',monospace; font-size:0.62rem;
+                                    letter-spacing:0.08em; color:{level_color}; padding:2px 8px;
+                                    background:rgba({','.join(str(int(level_color.lstrip('#')[i:i+2], 16)) for i in (0,2,4))},0.12);
+                                    border-radius:4px;">
+                            {level}
+                        </span>
                     </div>
-                    <span style="font-family:'Roboto Mono',monospace; font-size:0.68rem; color:#8a9ab8;
-                                min-width:60px; text-align:right;">
-                        z = {z:+.1f}
-                    </span>
+                    <div style="display:flex; align-items:center; gap:10px;">
+                        <div style="flex:1; height:6px; background:var(--border-light); border-radius:3px; overflow:hidden;">
+                            <div style="width:{bar_pct}%; height:100%; background:{bar_color};
+                                        border-radius:3px; transition:width 1.2s cubic-bezier(0.4,0,0.2,1);"></div>
+                        </div>
+                        <span style="font-family:'Roboto Mono',monospace; font-size:0.68rem; color:#8a9ab8;
+                                    min-width:60px; text-align:right;">
+                            z = {z:+.1f}
+                        </span>
+                    </div>
+                    <div style="display:flex; justify-content:space-between; margin-top:3px;">
+                        <span style="font-family:'Roboto Mono',monospace; font-size:0.62rem; color:#6b7b98;">
+                            Vendor: <span style="color:var(--text-main);">{val_fmt}</span>
+                        </span>
+                        <span style="font-family:'Roboto Mono',monospace; font-size:0.62rem; color:#6b7b98;">
+                            Pop. Mean: {mean_fmt}
+                        </span>
+                    </div>
                 </div>
-                <div style="display:flex; justify-content:space-between; margin-top:3px;">
-                    <span style="font-family:'Roboto Mono',monospace; font-size:0.62rem; color:#6b7b98;">
-                        Vendor: <span style="color:#c8d8f0;">{val_fmt}</span>
-                    </span>
-                    <span style="font-family:'Roboto Mono',monospace; font-size:0.62rem; color:#6b7b98;">
-                        Pop. Mean: {mean_fmt}
-                    </span>
-                </div>
-            </div>
-            """
+                """
+            return html
+
+        deviation_html_top = build_deviation_html(top_deviations)
+        deviation_html_other = build_deviation_html(other_deviations) if other_deviations else ""
 
         # Generate natural language summary
         unusual = [fd for fd in feature_deviations if fd["level"] in ("HIGH", "EXTREME")]
@@ -1346,7 +1969,7 @@ def render_risk_analysis_tab(result, selected_vendor, selected_product):
             mod_names = " and ".join([fd["feature"] for fd in moderate])
             nl_summary = f"No extreme deviations detected, but {mod_names} {'show' if len(moderate) > 1 else 'shows'} moderate variance from population averages. The vendor is not an outlier, but these features are worth monitoring over time."
         else:
-            nl_summary = "All four features fall within normal population bounds. This vendor's behaviour is statistically typical — no single feature or combination of features deviates meaningfully from the norm."
+            nl_summary = "All features fall within normal population bounds. This vendor's behaviour is statistically typical — no single feature or combination of features deviates meaningfully from the norm."
 
         st.html(f"""
 <div style="background:{'rgba(248,81,73,0.03)' if is_outlier else 'rgba(20,240,160,0.03)'};
@@ -1356,14 +1979,29 @@ def render_risk_analysis_tab(result, selected_vendor, selected_product):
                 color:#8a9ab8; letter-spacing:0.1em; margin-bottom:12px;">
         // FEATURE DEVIATION ANALYSIS — POPULATION COMPARISON
     </div>
-    {deviation_html}
-    <div style="margin-top:16px; padding-top:14px; border-top:1px solid rgba(255,255,255,0.06);">
+    {deviation_html_top}
+</div>
+""")
+        
+        if deviation_html_other:
+            with st.expander("View All Feature Deviations"):
+                st.html(f"""
+                <div style="padding-top: 10px;">
+                    {deviation_html_other}
+                </div>
+                """)
+
+        st.html(f"""
+<div style="background:{'rgba(248,81,73,0.03)' if is_outlier else 'rgba(20,240,160,0.03)'};
+            border-left:3px solid {iso_color}; padding:16px 20px; margin-top:0px;
+            margin-bottom:16px; border-radius:0 8px 8px 0;">
+    <div style="padding-top:0px;">
         <div style="font-family:'Roboto Mono',monospace; font-size:0.62rem;
                     color:#6b7b98; letter-spacing:0.08em; margin-bottom:6px;">
             // AI INTERPRETATION
         </div>
         <div style="font-family:'Inter',sans-serif; font-size:0.82rem;
-                    color:#c8d8f0; line-height:1.6;">
+                    color:var(--text-main); line-height:1.6;">
             {nl_summary}
         </div>
     </div>
@@ -1387,10 +2025,10 @@ def render_risk_analysis_tab(result, selected_vendor, selected_product):
     past_dealings_count = vendor_history_data.get("transaction_count", 64)
     st.markdown(f"""
     <p style="color:#8a9ab8; font-size:0.82rem; font-family:'Roboto Mono',monospace; letter-spacing:0.05em; margin-bottom:6px;">
-        Historical Risk Fluctuation (Past 12 Months) — Calculated from <span style="color:#c8d8f0;">{past_dealings_count}</span> past dealings
+        Historical Risk Fluctuation (Past 12 Months) — Calculated from <span style="color:var(--text-main);">{past_dealings_count}</span> past dealings
     </p>
     <p style="color:#6b7b98; font-size:0.62rem; font-family:'Roboto Mono',monospace; letter-spacing:0.04em;
-              margin-bottom:16px; padding:6px 10px; background:rgba(255,255,255,0.02); border-radius:4px;
+              margin-bottom:16px; padding:6px 10px; background:var(--bg-hover); border-radius:4px;
               border-left:2px solid rgba(240,184,64,0.3);">
         ⚠ SIMULATED DATA — This timeline is synthetically generated around the vendor's real XGBoost risk score ({vendor_history_data.get('monthly_risk_history', [0])[0]:.2f} baseline).
         It illustrates plausible risk fluctuation patterns but does not reflect actual month-by-month historical records.
@@ -1407,7 +2045,7 @@ def render_risk_analysis_tab(result, selected_vendor, selected_product):
         mode='lines+markers',
         name='Historical Risk Score',
         line=dict(color='#50a0ff', width=2.5, shape='spline'),
-        marker=dict(size=7, color='#50a0ff', symbol='diamond', line=dict(color='#050810', width=1.5)),
+        marker=dict(size=7, color='#50a0ff', symbol='diamond', line=dict(color='var(--bg-app)', width=1.5)),
         fill='tozeroy',
         fillcolor='rgba(80,160,255,0.05)',
     ))
@@ -1420,13 +2058,13 @@ def render_risk_analysis_tab(result, selected_vendor, selected_product):
     fig_history.update_layout(
         xaxis_title="Timeline",
         yaxis_title="Risk Score (0 to 1)",
-        yaxis=dict(range=[0, 1], gridcolor='rgba(255,255,255,0.03)', zerolinecolor='rgba(255,255,255,0.03)'),
-        xaxis=dict(gridcolor='rgba(255,255,255,0.03)'),
+        yaxis=dict(range=[0, 1], gridcolor='var(--bg-hover)', zerolinecolor='var(--bg-hover)'),
+        xaxis=dict(gridcolor='var(--bg-hover)'),
         height=350,
         margin=dict(l=20, r=20, t=30, b=20),
-        paper_bgcolor='rgba(0,0,0,0)',
-        plot_bgcolor='rgba(10,14,26,0.6)',
-        font={'color': '#94a3b8', 'family': 'Inter'}
+        paper_bgcolor=st.session_state.get('paper_bg', 'rgba(0,0,0,0)'),
+        plot_bgcolor=st.session_state.get('plot_bg', 'rgba(10,14,26,0.6)'),
+        font={'color': 'var(--text-mute)', 'family': 'Inter'}
     )
 
     st.plotly_chart(fig_history, use_container_width=True)
@@ -1451,8 +2089,8 @@ def render_risk_analysis_tab(result, selected_vendor, selected_product):
     <div style="font-family:'Roboto Mono',monospace; font-size:0.65rem; color:#8a9ab8; letter-spacing:0.1em; margin-bottom:8px;">
         // CHART INTELLIGENCE SUMMARY
     </div>
-    <div style="font-family:'Inter',sans-serif; font-size:0.85rem; color:#c8d8f0; line-height:1.5;">
-        Analysis of the past 12 months indicates an <strong style="color:#f0f4ff;">{trend}</strong> risk trend, 
+    <div style="font-family:'Inter',sans-serif; font-size:0.85rem; color:var(--text-main); line-height:1.5;">
+        Analysis of the past 12 months indicates an <strong style="color:var(--text-head);">{trend}</strong> risk trend, 
         with an average risk score of <span style="color:{border_col}; font-weight:700;">{avg_risk:.2f}</span>. 
         {trend_text}
     </div>
@@ -1470,7 +2108,7 @@ def render_risk_analysis_tab(result, selected_vendor, selected_product):
         Order Volume Pattern Analysis — Detecting abnormal quotation quantities
     </p>
     <p style="color:#6b7b98; font-size:0.62rem; font-family:'Roboto Mono',monospace; letter-spacing:0.04em;
-              margin-bottom:16px; padding:6px 10px; background:rgba(255,255,255,0.02); border-radius:4px;
+              margin-bottom:16px; padding:6px 10px; background:var(--bg-hover); border-radius:4px;
               border-left:2px solid rgba(240,184,64,0.3);">
         ⚠ SIMULATED DATA — Order volumes are synthetically generated based on the vendor's risk profile.
         Higher-risk vendors produce more volume anomalies (spikes above threshold). This demonstrates the anomaly detection
@@ -1493,7 +2131,7 @@ def render_risk_analysis_tab(result, selected_vendor, selected_product):
         marker=dict(
             color=colors_scatter,
             size=sizes_scatter,
-            line=dict(color='rgba(255,255,255,0.15)', width=1),
+            line=dict(color='var(--border-med)', width=1),
             opacity=0.9,
         ),
         text=[f"Transaction {t}: {s} units" + (" (ANOMALY DETECTED)" if s > 1000 else "") for t, s in zip(transactions, order_sizes)],
@@ -1508,13 +2146,13 @@ def render_risk_analysis_tab(result, selected_vendor, selected_product):
     fig_patterns.update_layout(
         xaxis_title="Recent Transactions (Last 50)",
         yaxis_title="Volume / Quantity Quoted",
-        yaxis=dict(gridcolor='rgba(255,255,255,0.03)', zerolinecolor='rgba(255,255,255,0.03)'),
-        xaxis=dict(gridcolor='rgba(255,255,255,0.03)'),
+        yaxis=dict(gridcolor='var(--bg-hover)', zerolinecolor='var(--bg-hover)'),
+        xaxis=dict(gridcolor='var(--bg-hover)'),
         height=350,
         margin=dict(l=20, r=20, t=30, b=20),
-        paper_bgcolor='rgba(0,0,0,0)',
-        plot_bgcolor='rgba(10,14,26,0.6)',
-        font={'color': '#94a3b8', 'family': 'Inter'}
+        paper_bgcolor=st.session_state.get('paper_bg', 'rgba(0,0,0,0)'),
+        plot_bgcolor=st.session_state.get('plot_bg', 'rgba(10,14,26,0.6)'),
+        font={'color': 'var(--text-mute)', 'family': 'Inter'}
     )
 
     st.plotly_chart(fig_patterns, use_container_width=True)
@@ -1535,7 +2173,7 @@ def render_risk_analysis_tab(result, selected_vendor, selected_product):
     <div style="font-family:'Roboto Mono',monospace; font-size:0.65rem; color:#8a9ab8; letter-spacing:0.1em; margin-bottom:8px;">
         // CHART INTELLIGENCE SUMMARY
     </div>
-    <div style="font-family:'Inter',sans-serif; font-size:0.85rem; color:#c8d8f0; line-height:1.5;">
+    <div style="font-family:'Inter',sans-serif; font-size:0.85rem; color:var(--text-main); line-height:1.5;">
         Detected <span style="color:{a_border}; font-weight:700;">{anomalies_count} anomalous transactions</span> 
         out of the last 50 orders ({anomaly_pct:.1f}% frequency). {a_text}
     </div>
@@ -1580,8 +2218,8 @@ def render_vendor_comparison_tab(selected_vendor, selected_product):
             <p style="color:#f85149; font-family:'Inter',sans-serif; font-weight:700; font-size:1rem; margin:0 0 6px 0;">
                 Better Alternatives Exist for This Transaction
             </p>
-            <p style="color:#c8d8f0; font-family:'Inter',sans-serif; font-size:0.88rem; margin:0;">
-                <span style="color:#f0f4ff; font-weight:600;">{selected_vendor}</span> carries elevated risk.
+            <p style="color:var(--text-main); font-family:'Inter',sans-serif; font-size:0.88rem; margin:0;">
+                <span style="color:var(--text-head); font-weight:600;">{selected_vendor}</span> carries elevated risk.
                 Consider <span style="color:#14f0a0; font-weight:600;">{top_names}</span> for lower risk exposure.
             </p>
         </div>
@@ -1601,8 +2239,8 @@ def render_vendor_comparison_tab(selected_vendor, selected_product):
             <p style="color:#f0b840; font-family:'Inter',sans-serif; font-weight:700; font-size:1rem; margin:0 0 6px 0;">
                 Sub-optimal Vendor Selection
             </p>
-            <p style="color:#c8d8f0; font-family:'Inter',sans-serif; font-size:0.88rem; margin:0;">
-                <span style="color:#f0f4ff; font-weight:600;">{selected_vendor}</span> has a moderate risk profile or is outranked.
+            <p style="color:var(--text-main); font-family:'Inter',sans-serif; font-size:0.88rem; margin:0;">
+                <span style="color:var(--text-head); font-weight:600;">{selected_vendor}</span> has a moderate risk profile or is outranked.
                 Consider <span style="color:#14f0a0; font-weight:600;">{top_names}</span> for better terms.
             </p>
         </div>
@@ -1620,7 +2258,7 @@ def render_vendor_comparison_tab(selected_vendor, selected_product):
             <p style="color:#14f0a0; font-family:'Inter',sans-serif; font-weight:700; font-size:1rem; margin:0 0 6px 0;">
                 Optimal Vendor Selection
             </p>
-            <p style="color:#c8d8f0; font-family:'Inter',sans-serif; font-size:0.88rem; margin:0;">
+            <p style="color:var(--text-main); font-family:'Inter',sans-serif; font-size:0.88rem; margin:0;">
                 You have selected one of the lowest-risk vendors for this transaction.
             </p>
         </div>
@@ -1632,7 +2270,7 @@ def render_vendor_comparison_tab(selected_vendor, selected_product):
 
     st.html(f"""
 <p style="color:#8a9ab8; font-size:0.82rem; font-family:'Roboto Mono',monospace; letter-spacing:0.05em; margin-bottom:24px;">
-    Ranked by overall risk score for <span style="color:#c8d8f0;">{selected_product}</span> — lowest risk = best
+    Ranked by overall risk score for <span style="color:var(--text-main);">{selected_product}</span> — lowest risk = best
 </p>
 """)
 
@@ -1649,7 +2287,7 @@ def render_vendor_comparison_tab(selected_vendor, selected_product):
             border_color = "rgba(20, 240, 160, 0.4)"
             border_width = "1px"
         else:
-            border_color = "rgba(255,255,255,0.06)"
+            border_color = "var(--border-light)"
             border_width = "1px"
 
         # Risk badge
@@ -1685,12 +2323,21 @@ def render_vendor_comparison_tab(selected_vendor, selected_product):
         if is_recommended and not is_selected:
             recommended_tag = '<span style="background:rgba(20,240,160,0.12); color:#14f0a0; padding:3px 10px; border-radius:6px; font-family:\'Roboto Mono\',monospace; font-size:0.62rem; letter-spacing:0.08em; margin-left:12px;">RECOMMENDED</span>'
 
+        # Right: Progress Bar + Badge
+        sap_label = s.get('sap_risk_label', s.get('xgb_prediction', {}).get('sap_risk_class', 'Unknown'))
+        sap_divergence = s.get('sap_divergence', False)
+        
+        if sap_divergence:
+            sap_badge = f'<div style="background:rgba(240,184,64,0.1); border:1px solid rgba(240,184,64,0.4); color:#f0b840; padding:3px 10px; border-radius:6px; font-family:\'Inter\',sans-serif; font-size:0.65rem; font-weight:600; letter-spacing:0.05em; margin-top:6px;">⚠️ SAP: {sap_label}</div>'
+        else:
+            sap_badge = f'<div style="background:transparent; border:1px solid var(--border-light); color:var(--text-mute); padding:3px 10px; border-radius:6px; font-family:\'Inter\',sans-serif; font-size:0.65rem; font-weight:600; letter-spacing:0.05em; margin-top:6px;">SAP: {sap_label}</div>'
+
         st.html(f"""
-<div style="background:rgba(10,14,26,0.85); border:{border_width} solid {border_color}; border-radius:14px;
+<div style="background:var(--bg-card); border:{border_width} solid {border_color}; border-radius:14px;
             padding:24px 28px; margin-bottom:16px; position:relative; overflow:hidden;
             animation: fadeSlideUp 0.6s ease-out both; animation-delay: {rank_num * 0.08}s;">
     <div style="position:absolute; top:0; left:0; right:0; height:1px;
-                background:linear-gradient(90deg, transparent, {'rgba(20,240,160,0.3)' if is_selected else 'rgba(255,255,255,0.05)'}, transparent);"></div>
+                background:linear-gradient(90deg, transparent, {'rgba(20,240,160,0.3)' if is_selected else 'var(--border-light)'}, transparent);"></div>
 
     <div style="display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:16px;">
         <!-- Left: Rank + Name -->
@@ -1701,11 +2348,11 @@ def render_vendor_comparison_tab(selected_vendor, selected_product):
                 #{rank_num}
             </div>
             <div>
-                <div style="font-family:'Inter',sans-serif; font-size:1.05rem; font-weight:700; color:#f0f4ff;">
+                <div style="font-family:'Inter',sans-serif; font-size:1.05rem; font-weight:700; color:var(--text-head);">
                     {vendor_name_map.get(s['vendor_id'], s['vendor_id'])}{selected_tag}{recommended_tag}
                 </div>
-                <div style="font-family:'Roboto Mono',monospace; font-size:0.65rem; color:#94a3b8; letter-spacing:0.08em; margin-top:4px;">
-                    {s['vendor_id']} &nbsp;|&nbsp; AVG CLEARANCE: {s['avg_clearance_days']}d &nbsp;|&nbsp; QUOTED: <span style="color:#c8d8f0;">${s['vendor_raw_price']:,.2f}</span>
+                <div style="font-family:'Roboto Mono',monospace; font-size:0.65rem; color:var(--text-mute); letter-spacing:0.08em; margin-top:4px;">
+                    {s['vendor_id']} &nbsp;|&nbsp; AVG CLEARANCE: {s['avg_clearance_days']}d &nbsp;|&nbsp; QUOTED: <span style="color:var(--text-main);">${s['vendor_raw_price']:,.2f}</span>
                 </div>
             </div>
         </div>
@@ -1713,19 +2360,19 @@ def render_vendor_comparison_tab(selected_vendor, selected_product):
         <!-- Center: Score Metrics -->
         <div style="display:flex; gap:32px; align-items:center;">
             <div style="text-align:center;">
-                <div style="font-family:'Roboto Mono',monospace; font-size:0.58rem; color:#94a3b8; letter-spacing:0.1em; text-transform:uppercase; margin-bottom:4px;">Overall Risk</div>
+                <div style="font-family:'Roboto Mono',monospace; font-size:0.58rem; color:var(--text-mute); letter-spacing:0.1em; text-transform:uppercase; margin-bottom:4px;">Overall Risk</div>
                 <div style="font-family:'Inter',sans-serif; font-size:1.4rem; font-weight:800; color:{bar_color};">{fr:.2f}</div>
             </div>
             <div style="text-align:center;">
-                <div style="font-family:'Roboto Mono',monospace; font-size:0.58rem; color:#94a3b8; letter-spacing:0.1em; text-transform:uppercase; margin-bottom:4px;">Vendor Risk</div>
-                <div style="font-family:'Inter',sans-serif; font-size:1.1rem; font-weight:700; color:#c8d8f0;">{s['vendor_risk']:.2f}</div>
+                <div style="font-family:'Roboto Mono',monospace; font-size:0.58rem; color:var(--text-mute); letter-spacing:0.1em; text-transform:uppercase; margin-bottom:4px;">Vendor Risk</div>
+                <div style="font-family:'Inter',sans-serif; font-size:1.1rem; font-weight:700; color:var(--text-main);">{s['vendor_risk']:.2f}</div>
             </div>
             <div style="text-align:center;">
-                <div style="font-family:'Roboto Mono',monospace; font-size:0.58rem; color:#94a3b8; letter-spacing:0.1em; text-transform:uppercase; margin-bottom:4px;">Price Risk</div>
-                <div style="font-family:'Inter',sans-serif; font-size:1.1rem; font-weight:700; color:#c8d8f0;">{s['price_risk']:.1f}</div>
+                <div style="font-family:'Roboto Mono',monospace; font-size:0.58rem; color:var(--text-mute); letter-spacing:0.1em; text-transform:uppercase; margin-bottom:4px;">Price Risk</div>
+                <div style="font-family:'Inter',sans-serif; font-size:1.1rem; font-weight:700; color:var(--text-main);">{s['price_risk']:.1f}</div>
             </div>
             <div style="text-align:center;">
-                <div style="font-family:'Roboto Mono',monospace; font-size:0.58rem; color:#94a3b8; letter-spacing:0.1em; text-transform:uppercase; margin-bottom:4px;">Outlier Score</div>
+                <div style="font-family:'Roboto Mono',monospace; font-size:0.58rem; color:var(--text-mute); letter-spacing:0.1em; text-transform:uppercase; margin-bottom:4px;">Outlier Score</div>
                 <div style="font-family:'Inter',sans-serif; font-size:1.1rem; font-weight:700; color:{'#f85149' if s.get('isolation_score', 0.5) > 0.75 else '#f0b840' if s.get('isolation_score', 0.5) > 0.5 else '#14f0a0'};">{s.get('isolation_score', 0.5):.2f}</div>
             </div>
         </div>
@@ -1737,7 +2384,8 @@ def render_vendor_comparison_tab(selected_vendor, selected_product):
                         font-weight:700; letter-spacing:0.08em;">
                 {bucket}
             </div>
-            <div style="width:100%; height:6px; background:rgba(255,255,255,0.05); border-radius:3px; overflow:hidden;">
+            {sap_badge}
+            <div style="width:100%; height:6px; background:var(--border-light); border-radius:3px; overflow:hidden;">
                 <div style="width:{fr * 100}%; height:100%; background:{bar_color}; border-radius:3px;
                             transition: width 1.2s ease;"></div>
             </div>
@@ -1745,6 +2393,174 @@ def render_vendor_comparison_tab(selected_vendor, selected_product):
     </div>
 </div>
 """)
+
+
+def render_chatbot_tab(result, selected_vendor, selected_product):
+    st.markdown("""
+    <style>
+    /* Darken standard Streamlit buttons in the Chatbot tab */
+    .stTabs .stButton > button {
+        background-color: var(--bg-card) !important;
+        border: 1px solid var(--border-med) !important;
+        color: var(--text-main) !important;
+        border-radius: 8px !important;
+    }
+    .stTabs .stButton > button:hover {
+        border-color: #14f0a0 !important;
+        color: #14f0a0 !important;
+        background-color: rgba(20, 240, 160, 0.05) !important;
+    }
+    
+    /* Processing Indicator Animations */
+    .ai-processing-ring {
+        width: 14px;
+        height: 14px;
+        border: 2px solid rgba(20, 240, 160, 0.2);
+        border-top-color: #14f0a0;
+        border-radius: 50%;
+        animation: ai-spin 1s linear infinite;
+    }
+    @keyframes ai-spin { 100% { transform: rotate(360deg); } }
+    @keyframes ai-pulse { 50% { opacity: 0.5; } }
+    
+    /* Risk-based Vendor Button Borders */
+    div.element-container:has(.risk-marker-LOW) + div.element-container .stButton > button {
+        border-left: 4px solid #14f0a0 !important;
+    }
+    div.element-container:has(.risk-marker-MEDIUM) + div.element-container .stButton > button {
+        border-left: 4px solid #f0b840 !important;
+    }
+    div.element-container:has(.risk-marker-HIGH) + div.element-container .stButton > button {
+        border-left: 4px solid #f85149 !important;
+    }
+    
+    /* Hide the marker containers to prevent empty gaps */
+    div.element-container:has(.risk-marker-LOW),
+    div.element-container:has(.risk-marker-MEDIUM),
+    div.element-container:has(.risk-marker-HIGH) {
+        display: none !important;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+    
+    all_scores = st.session_state.get('all_vendor_scores', [])
+    
+    col_left, col_right = st.columns([1, 2.5], gap="large")
+    
+    with col_left:
+        st.markdown("""
+        <div style="font-family:'Roboto Mono',monospace; font-size:0.75rem; font-weight:600; color:var(--text-mute); letter-spacing:0.1em; text-transform:uppercase; margin-bottom:16px;">
+            Alternative Vendors
+        </div>
+        """, unsafe_allow_html=True)
+        
+        sap_vendors = get_sap_vendor_list()
+        vendor_name_map = {v['lifnr']: v['name'] for v in sap_vendors}
+        
+        with st.container(height=650):
+            for s in all_scores:
+                v_name = vendor_name_map.get(s["vendor_id"], s["vendor_id"])
+                is_selected = s["vendor_id"] == result.get("vendor_id")
+                rank = s.get("rank", "-")
+                bucket = s.get("vendor_bucket", "N/A")
+                score = s.get("final_risk", 0.0)
+                
+                selected_text = " ✓" if is_selected else ""
+                btn_label = f"#{rank} {v_name} | {bucket} | {score:.2f}{selected_text}"
+                
+                st.markdown(f'<div class="risk-marker-{bucket}"></div>', unsafe_allow_html=True)
+                if st.button(btn_label, key=f"chat_vendor_{s['vendor_id']}", use_container_width=True):
+                    if is_selected:
+                        st.session_state['chat_prefill'] = f"Give me a full breakdown of {v_name}'s risk"
+                    else:
+                        st.session_state['chat_prefill'] = f"Compare {selected_vendor} with {v_name}"
+                    st.rerun()
+
+    with col_right:
+        st.markdown('<div class="section-header">Chat with AI Risk Analyst</div>', unsafe_allow_html=True)
+        
+        if "chat_history" not in st.session_state:
+            final_risk = result.get('final_risk', 0)
+            decision = result.get('decision', 'N/A')
+            greeting = f"Hello! I am your AI Risk Analyst. I have reviewed the data for **{selected_vendor}**. Their final risk score is **{final_risk:.2f}** ({decision}). How can I help you analyze this vendor or compare alternatives?"
+            st.session_state["chat_history"] = [{"role": "assistant", "content": greeting}]
+            
+        with st.container(height=500):
+            for msg in st.session_state["chat_history"]:
+                if msg["role"] == "user":
+                    col1, col2 = st.columns([1, 5])
+                    with col2:
+                        content_text = msg['content'].replace('$', '\\$').replace(chr(10), '<br>')
+                        st.markdown(f'''<div style="background: rgba(80, 160, 255, 0.1); border: 1px solid rgba(80, 160, 255, 0.3); border-radius: 12px; padding: 12px 16px; margin-bottom: 16px; text-align: right; color: var(--text-main); line-height: 1.5; font-family: 'Inter', sans-serif; font-size: 0.9rem;">
+{content_text}
+</div>''', unsafe_allow_html=True)
+                else:
+                    col1, col2 = st.columns([5, 1])
+                    with col1:
+                        content_text = msg['content'].replace('$', '\\$')
+                        st.markdown(f'''<div class="analytic-card" style="padding: 16px 20px; margin-bottom: 16px;">
+<div style="color: #14f0a0; font-family: 'Roboto Mono', monospace; font-size: 0.7rem; margin-bottom: 12px; letter-spacing: 0.1em;">AI RISK ANALYST</div>
+
+{content_text}
+
+</div>''', unsafe_allow_html=True)
+            
+        prefill = st.session_state.get('chat_prefill')
+        user_input = st.chat_input("Type your question here...")
+
+        if prefill or user_input:
+            prompt_text = prefill if prefill else user_input
+            if prefill:
+                st.session_state['chat_prefill'] = None
+            
+            st.session_state["chat_history"].append({"role": "user", "content": prompt_text})
+            
+            col1, col2 = st.columns([1, 5])
+            with col2:
+                prompt_display = prompt_text.replace('$', '\\$').replace(chr(10), '<br>')
+                st.markdown(f'''<div style="background: rgba(80, 160, 255, 0.1); border: 1px solid rgba(80, 160, 255, 0.3); border-radius: 12px; padding: 12px 16px; margin-bottom: 16px; text-align: right; color: var(--text-main); line-height: 1.5; font-family: 'Inter', sans-serif; font-size: 0.9rem;">
+{prompt_display}
+</div>''', unsafe_allow_html=True)
+            
+            col1, col2 = st.columns([5, 1])
+            with col1:
+                placeholder = st.empty()
+                placeholder.markdown(f'''<div class="analytic-card" style="padding: 16px 20px; margin-bottom: 16px;">
+<div style="color: #14f0a0; font-family: 'Roboto Mono', monospace; font-size: 0.7rem; margin-bottom: 12px; letter-spacing: 0.1em;">AI RISK ANALYST</div>
+<div style="display: flex; align-items: center; gap: 12px;">
+    <div class="ai-processing-ring"></div>
+    <div style="color: #14f0a0; font-family: 'Roboto Mono', monospace; font-size: 0.8rem; letter-spacing: 0.1em; animation: ai-pulse 1.5s infinite;">SYNTHESIZING INSIGHTS...</div>
+</div>
+</div>''', unsafe_allow_html=True)
+            
+            sys_prompt = build_chatbot_context(result, selected_vendor, selected_product, all_scores)
+            full_response, err = call_openrouter(sys_prompt, st.session_state["chat_history"], stream_placeholder=placeholder)
+            
+            if err:
+                st.error(err)
+                st.session_state["chat_history"].pop()
+            elif full_response:
+                st.session_state["chat_history"].append({"role": "assistant", "content": full_response})
+                st.rerun()
+
+        st.markdown("<div style='margin-top: 16px;'></div>", unsafe_allow_html=True)
+        chip_col1, chip_col2, chip_col3, chip_col4 = st.columns(4)
+        with chip_col1:
+            if st.button("Why is this vendor high risk?", use_container_width=True, key="chip1"):
+                st.session_state['chat_prefill'] = "Why is this vendor high risk?"
+                st.rerun()
+        with chip_col2:
+            if st.button("Compare with best alternative", use_container_width=True, key="chip2"):
+                st.session_state['chat_prefill'] = "Compare with best alternative"
+                st.rerun()
+        with chip_col3:
+            if st.button("Should I approve this purchase?", use_container_width=True, key="chip3"):
+                st.session_state['chat_prefill'] = "Should I approve this purchase?"
+                st.rerun()
+        with chip_col4:
+            if st.button("Explain the SHAP values", use_container_width=True, key="chip4"):
+                st.session_state['chat_prefill'] = "Explain the SHAP values"
+                st.rerun()
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

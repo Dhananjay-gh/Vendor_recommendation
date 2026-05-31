@@ -1,0 +1,16 @@
+[
+  "avg_days_overdue_hist",
+  "late_ratio",
+  "total_spend_vol",
+  "open_exposure",
+  "payment_consistency_score",
+  "years_active",
+  "payment_terms_risk",
+  "is_payment_blocked",
+  "dunning_level",
+  "reversal_rate",
+  "discount_capture_rate",
+  "avg_payment_terms_days",
+  "voided_payment_rate",
+  "stale_payment_rate"
+]
