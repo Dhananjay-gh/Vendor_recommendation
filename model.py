@@ -403,7 +403,10 @@ def procurement_risk_model(vendor_lifnr, product_name, current_price):
     vendor_bucket = get_vendor_bucket(final_risk)
 
     if final_risk < 0.40:
-        decision = "APPROVE"
+        if variance < -0.3:
+            decision = "REVIEW"
+        else:
+            decision = "APPROVE"
     elif final_risk < 0.65:
         decision = "REVIEW"
     else:
@@ -458,6 +461,11 @@ def procurement_risk_model(vendor_lifnr, product_name, current_price):
             f"Price Warning: Quoted price is {round(variance*100, 1)}% above the "
             f"inflation-forecasted benchmark. Excessive markup detected."
         )
+    elif variance < -0.3:
+        insights.append(
+            f"Quality Warning: Quoted price is {round(abs(variance)*100, 1)}% below "
+            f"the forecasted benchmark. Such a suspiciously low price may indicate compromised product quality, missing features, or hidden costs. Please verify the specifications."
+        )
     elif variance < -0.05:
         insights.append(
             f"Price Advantage: Quoted price is {round(abs(variance)*100, 1)}% below "
@@ -494,7 +502,10 @@ def procurement_risk_model(vendor_lifnr, product_name, current_price):
     if decision == "HIGH RISK":
         insights.append("Recommendation: Avoid contract. Exposure exceeds risk tolerance thresholds.")
     elif decision == "REVIEW":
-        insights.append("Recommendation: Specialist review of the Quote vs. Forecast variance is required.")
+        if variance < -0.3:
+            insights.append("Recommendation: Manual review required. The quoted price is suspiciously low compared to the forecast, which may imply compromised quality.")
+        else:
+            insights.append("Recommendation: Specialist review of the Quote vs. Forecast variance is required.")
     else:
         insights.append("Recommendation: Automated approval granted. Pricing is optimal relative to the forecast.")
 

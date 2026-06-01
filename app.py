@@ -2586,4 +2586,4 @@ def main():
         render_analytics_page()
 
 if __name__ == "__main__":
-    main()
+    main()# End of application script.
