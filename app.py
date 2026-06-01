@@ -1666,6 +1666,10 @@ def render_risk_analysis_tab(result, selected_vendor, selected_product):
     # Compact chart height since we limit to max 6 bars
     shap_chart_height = 240
 
+    is_light = st.session_state.get('theme', 'light') == 'light'
+    shap_grid_color = 'rgba(0,0,0,0.05)' if is_light else 'rgba(255,255,255,0.03)'
+    shap_text_color = 'var(--text-main)' if is_light else '#ffffff'
+
     fig_shap = go.Figure(go.Bar(
         x=shap_values_list,
         y=shap_labels,
@@ -1673,7 +1677,7 @@ def render_risk_analysis_tab(result, selected_vendor, selected_product):
         marker_color=shap_colors,
         text=[f"{v:+.4f}" for v in shap_values_list],
         textposition='outside',
-        textfont=dict(color='var(--text-mute)', family='Roboto Mono', size=11),
+        textfont=dict(color=shap_text_color, family='Roboto Mono', size=11),
     ))
     fig_shap.update_layout(
         height=shap_chart_height,
@@ -1683,11 +1687,11 @@ def render_risk_analysis_tab(result, selected_vendor, selected_product):
         font=dict(color='var(--text-mute)', family='Inter'),
         xaxis=dict(
             title="SHAP Value (impact on prediction)",
-            gridcolor='var(--bg-hover)',
+            gridcolor=shap_grid_color,
             zerolinecolor='var(--border-med)',
             title_font=dict(size=11, color='var(--text-mute)', family='Roboto Mono'),
         ),
-        yaxis=dict(gridcolor='var(--bg-hover)'),
+        yaxis=dict(gridcolor=shap_grid_color),
     )
     st.plotly_chart(fig_shap, use_container_width=True)
 
@@ -1706,7 +1710,7 @@ def render_risk_analysis_tab(result, selected_vendor, selected_product):
             marker_color=all_shap_colors,
             text=[f"{v:+.4f}" for v in all_shap_values],
             textposition='outside',
-            textfont=dict(color='var(--text-mute)', family='Roboto Mono', size=11),
+            textfont=dict(color=shap_text_color, family='Roboto Mono', size=11),
         ))
         fig_shap_all.update_layout(
             height=all_chart_height,
@@ -1716,11 +1720,11 @@ def render_risk_analysis_tab(result, selected_vendor, selected_product):
             font=dict(color='var(--text-mute)', family='Inter'),
             xaxis=dict(
                 title="SHAP Value (impact on prediction)",
-                gridcolor='var(--bg-hover)',
+                gridcolor=shap_grid_color,
                 zerolinecolor='var(--border-med)',
                 title_font=dict(size=11, color='var(--text-mute)', family='Roboto Mono'),
             ),
-            yaxis=dict(gridcolor='var(--bg-hover)'),
+            yaxis=dict(gridcolor=shap_grid_color),
         )
         st.plotly_chart(fig_shap_all, use_container_width=True)
 
